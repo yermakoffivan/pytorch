@@ -59,8 +59,9 @@ fake_export_failures = {
     xfail("masked.var"),
 }
 
-# __getitem__ passes locally but still fails on CI OSDC shards.
+# These pass locally but still fail on CI OSDC shards.
 if IS_CI:
+    fake_export_failures.add(xfail("geqrf"))
     fake_export_failures.add(xfail("__getitem__"))
 
 fake_decomposition_failures = {
