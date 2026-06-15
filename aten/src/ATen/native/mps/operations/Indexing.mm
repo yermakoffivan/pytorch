@@ -590,6 +590,13 @@ TORCH_IMPL_FUNC(index_add_mps_out)
   const Tensor source_ = (source.dim() == 0) ? source.view(1) : source;
   const Tensor index_ = (index.dim() == 0) ? index.view(1) : index;
 
+  // Empty indexed dim: CPU index_add early-returns on an empty self without
+  // range-checking, so match that (no error) and skip the scatter, whose clamp
+  // to self_sizes[dim] - 1 == -1 would otherwise compute an invalid offset.
+  if (result_.size(dim) == 0) {
+    return;
+  }
+
   // fp16/bf16/chalf atomic add is emulated with a compare-and-swap loop that
   // collapses under index contention, while fp32/cfloat have a native atomic
   // add. Upcast the accumulation only when many indices map into few slots:
@@ -673,8 +680,24 @@ Tensor& index_select_out_mps(const Tensor& self, int64_t dim, const Tensor& inde
   }
   at::native::resize_output(output, output_size);
 
-  // Empty index
-  if (num_indices == 0 || self.numel() == 0) {
+  // Empty index: nothing to gather and no indices to range-check.
+  if (num_indices == 0) {
+    return output;
+  }
+
+  const Tensor index_ = (index.dim() == 0) ? index.view(1) : index;
+
+  // Empty input/output (a non-indexed dim is 0): there is nothing to gather, but
+  // still range-check the indices against self.size(dim) to match CPU/CUDA --
+  // indexing into a 0-sized dim is out of bounds. Skips dispatching a 0-sized
+  // gather grid.
+  if (self.numel() == 0) {
+    dispatch_sync_with_rethrow(stream->queue(), ^() {
+      @autoreleasepool {
+        id<MTLComputeCommandEncoder> computeEncoder = stream->commandEncoder();
+        encodeIndexBoundsCheck(computeEncoder, stream, index_, self.size(dim));
+      }
+    });
     return output;
   }
 
@@ -683,8 +706,6 @@ Tensor& index_select_out_mps(const Tensor& self, int64_t dim, const Tensor& inde
     output.copy_(self);
     return output;
   }
-
-  const Tensor index_ = (index.dim() == 0) ? index.view(1) : index;
 
   // Fast path: contiguous tensors viewed as [outer, dim, inner], gathered with a
   // 3D grid so each thread copies one element with no coordinate decomposition.
