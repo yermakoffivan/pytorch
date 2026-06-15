@@ -77,6 +77,8 @@ def _to(self, device, non_blocking=False):
     if device.type == "cpu":
         pin_memory = non_blocking and self.device.type in (
             "cuda",
+            "xpu",
+            "mtia",
             torch._C._get_privateuse1_backend_name(),
         )
         untyped_storage = torch.empty(
@@ -284,33 +286,23 @@ _sparse_tensors_to_validate: list["torch.Tensor"] = []
 # The same procedure must be followed by _load() in serialization.py because due
 # to Pickler semantics, we have to use the same (non-validating) function for
 # unpickling sparse tensors, regardless of the caller.
-def _validate_loaded_sparse_tensors(
-    validate_sparse=None,
-    weights_only=False,
-):
-    # validate_sparse is the torch.load keyword:
-    #   True  -> always validate (overrides the global invariants setting)
-    #   False -> skip validation
-    #   None  -> in weights_only mode the caller must make an explicit
-    #            choice; otherwise fall back to the global setting
+def _validate_loaded_sparse_tensors(weights_only=False):
+    # In weights_only mode we always validate: malformed sparse indices can
+    # cause out-of-bounds reads later (e.g. in to_dense()), and an untrusted
+    # checkpoint must not be able to slip those through. Otherwise we fall back
+    # to the global check_sparse_tensor_invariants setting.
     try:
         if not _sparse_tensors_to_validate:
             return
-        if validate_sparse is False:
+        if weights_only:
+            warnings.warn(
+                "Validating sparse tensor invariants because weights_only=True; "
+                "this is an O(nnz) scan per sparse tensor and may be slow for "
+                "large checkpoints.",
+                stacklevel=2,
+            )
+        elif not torch.sparse.check_sparse_tensor_invariants().is_enabled():
             return
-        if validate_sparse is None:
-            if weights_only:
-                raise RuntimeError(
-                    "The checkpoint contains a sparse tensor. Malformed "
-                    "sparse indices can cause out-of-bounds reads later "
-                    "(e.g. in to_dense()), so weights_only=True will not "
-                    "silently accept them. Pass `validate_sparse=True` to "
-                    "torch.load to check invariants (an O(nnz) scan per "
-                    "tensor), or `validate_sparse=False` to opt out and "
-                    "accept potentially unsafe tensors."
-                )
-            if not torch.sparse.check_sparse_tensor_invariants().is_enabled():
-                return
         # We disable pinning check (see check_pinning=False below) to
         # avoid gh-153143. In fact, pinning check is unnecessary
         # anywhy when loading sparse data from external sources.

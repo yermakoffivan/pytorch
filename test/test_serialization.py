@@ -1204,6 +1204,17 @@ class TestSerialization(TestCase, SerializationMixin):
             f.seek(0)
             state = torch.load(f)
 
+
+        gc.collect()
+        if IS_FILESYSTEM_UTF8_ENCODING:
+            with TemporaryDirectoryName(suffix='\u975eASCII\u30d1\u30b9') as dname:
+                with TemporaryFileName(dir=dname) as fname:
+                    # https://github.com/pytorch/pytorch/issues/185098
+                    data = torch.rand(200, 2048, 2048, dtype=torch.float32)  # ~3.13 GiB storage
+                    torch.save(data, fname)
+                    loaded_data = torch.load(fname)
+                    self.assertEqual(loaded_data, data)
+
     @serialTest()
     def test_serialization_4gb_file(self):
         '''
@@ -4536,9 +4547,7 @@ class TestSerialization(TestCase, SerializationMixin):
                 torch.save(sd, f)
             f.seek(0)
             with safe_globals([TwoTensor]):
-                # validate_sparse=False: skip_data leaves indices uninitialized
-                # so invariant checks aren't meaningful here.
-                sd_loaded = torch.load(f, weights_only=True, validate_sparse=False)
+                sd_loaded = torch.load(f, weights_only=True)
             self.assertEqual(sd_loaded, sd_expected, exact_device=True)
             self.assertFalse(getattr(torch.serialization._serialization_tls, "materialize_fake_tensors", False))
             self.assertFalse(getattr(torch.serialization._serialization_tls, "skip_data", False))
@@ -5015,10 +5024,11 @@ class TestSerialization(TestCase, SerializationMixin):
             )
 
     def test_weights_only_validate_sparse(self):
-        # torch.load(validate_sparse=...) controls whether sparse invariants
-        # are checked after unpickling. In weights_only mode the default
-        # (None) refuses to load sparse content silently and forces the
-        # caller to opt in (True, run the O(nnz) check) or out (False).
+        # weights_only=True always validates sparse tensor invariants (with a
+        # warning that it may be slow) so a malformed checkpoint cannot slip an
+        # out-of-bounds index past the loader. weights_only=False keeps the
+        # historical behaviour of deferring to the global
+        # check_sparse_tensor_invariants setting.
         good = torch.sparse_coo_tensor(
             torch.tensor([[0, 1]]), torch.tensor([1.0, 2.0]), (2,),
         )
@@ -5031,33 +5041,21 @@ class TestSerialization(TestCase, SerializationMixin):
         bad_buf = io.BytesIO()
         torch.save({"s": bad}, bad_buf)
 
-        # weights_only + sparse + validate_sparse=None must raise
-        bad_buf.seek(0)
-        with self.assertRaisesRegex(
-            RuntimeError, "weights_only=True will not silently accept them"
-        ):
-            torch.load(bad_buf, weights_only=True)
-
-        # validate_sparse=False loads without running checks (invariants
-        # left broken; user has explicitly opted out)
-        bad_buf.seek(0)
-        out = torch.load(bad_buf, weights_only=True, validate_sparse=False)
-        self.assertEqual(out["s"]._nnz(), 2)
-
-        # validate_sparse=True catches the OOB index
+        # weights_only=True catches the OOB index
         bad_buf.seek(0)
         with self.assertRaisesRegex(RuntimeError, "size is inconsistent with indices"):
-            torch.load(bad_buf, weights_only=True, validate_sparse=True)
+            torch.load(bad_buf, weights_only=True)
 
-        # validate_sparse=True on a well-formed checkpoint round-trips
+        # weights_only=True on a well-formed checkpoint round-trips
         good_buf.seek(0)
-        out = torch.load(good_buf, weights_only=True, validate_sparse=True)
+        with self.assertWarnsRegex(UserWarning, "weights_only=True"):
+            out = torch.load(good_buf, weights_only=True)
         self.assertEqual(out["s"].to_dense(), good.to_dense())
 
-        # weights_only=False keeps today's behaviour: no opt-in required,
-        # falls back to the global check_sparse_tensor_invariants setting.
-        # The test framework force-enables that global, so explicitly
-        # disable it to exercise the "global off" path.
+        # weights_only=False keeps today's behaviour: falls back to the global
+        # check_sparse_tensor_invariants setting. The test framework
+        # force-enables that global, so explicitly disable it to exercise the
+        # "global off" path.
         bad_buf.seek(0)
         with torch.sparse.check_sparse_tensor_invariants(False):
             out = torch.load(bad_buf, weights_only=False)
