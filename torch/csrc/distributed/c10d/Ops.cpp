@@ -305,7 +305,7 @@ IMPL_ALLGATHER(PrivateUse1)
     auto hook_op_id = process_group->firePreHook(                          \
         HookOpName::ALLGATHER, asyncOp, -1, input_tensor, output_tensor);  \
     auto work = process_group->getBackend(c10::DeviceType::DEV)            \
-                    ->_allgather_base(                                     \
+                    ->all_gather_single(                                   \
                         output_tensor,                                     \
                         input_tensor,                                      \
                         AllgatherOptions{                                  \
@@ -346,24 +346,24 @@ IMPL_ALLGATHER_COALESCED(CPU)
 IMPL_ALLGATHER_COALESCED(CUDA)
 IMPL_ALLGATHER_COALESCED(PrivateUse1)
 
-#define IMPL_ALLGATHER_INTO_TENSOR_COALESCED(DEV)                           \
-  c10::intrusive_ptr<c10d::Work> allgather_into_tensor_coalesced_##DEV(     \
-      at::TensorList outputs,                                               \
-      at::TensorList inputs,                                                \
-      const c10::intrusive_ptr<ProcessGroup>& process_group,                \
-      bool asyncOp) {                                                       \
-    auto output_vec = outputs.vec();                                        \
-    auto input_vec = inputs.vec();                                          \
-    auto opts = AllgatherOptions{};                                         \
-    opts.asyncOp = asyncOp;                                                 \
-    auto hook_op_id = process_group->firePreHook(                           \
-        HookOpName::ALLGATHER, asyncOp, -1, input_vec, output_vec);         \
-    auto work =                                                             \
-        process_group->getBackend(c10::DeviceType::DEV)                     \
-            ->allgather_into_tensor_coalesced(output_vec, input_vec, opts); \
-    process_group->firePostHook(                                            \
-        HookOpName::ALLGATHER, asyncOp, hook_op_id, work);                  \
-    return work;                                                            \
+#define IMPL_ALLGATHER_INTO_TENSOR_COALESCED(DEV)                       \
+  c10::intrusive_ptr<c10d::Work> allgather_into_tensor_coalesced_##DEV( \
+      at::TensorList outputs,                                           \
+      at::TensorList inputs,                                            \
+      const c10::intrusive_ptr<ProcessGroup>& process_group,            \
+      bool asyncOp) {                                                   \
+    auto output_vec = outputs.vec();                                    \
+    auto input_vec = inputs.vec();                                      \
+    auto opts = AllgatherOptions{};                                     \
+    opts.asyncOp = asyncOp;                                             \
+    auto hook_op_id = process_group->firePreHook(                       \
+        HookOpName::ALLGATHER, asyncOp, -1, input_vec, output_vec);     \
+    auto work =                                                         \
+        process_group->getBackend(c10::DeviceType::DEV)                 \
+            ->all_gather_single_coalesced(output_vec, input_vec, opts); \
+    process_group->firePostHook(                                        \
+        HookOpName::ALLGATHER, asyncOp, hook_op_id, work);              \
+    return work;                                                        \
   }
 
 IMPL_ALLGATHER_INTO_TENSOR_COALESCED(CPU)
@@ -416,7 +416,7 @@ IMPL_REDUCE_SCATTER(PrivateUse1)
     auto hook_op_id = process_group->firePreHook(                              \
         HookOpName::REDUCE_SCATTER, asyncOp, -1, input_tensor, output_tensor); \
     auto work = process_group->getBackend(c10::DeviceType::DEV)                \
-                    ->_reduce_scatter_base(                                    \
+                    ->reduce_scatter_single(                                   \
                         output_tensor,                                         \
                         input_tensor,                                          \
                         ReduceScatterOptions{                                  \
@@ -446,7 +446,7 @@ IMPL__REDUCE_SCATTER_BASE(PrivateUse1)
     auto hook_op_id = process_group->firePreHook(                        \
         HookOpName::REDUCE_SCATTER, asyncOp, -1, input_vec, output_vec); \
     auto work = process_group->getBackend(c10::DeviceType::DEV)          \
-                    ->reduce_scatter_tensor_coalesced(                   \
+                    ->reduce_scatter_single_coalesced(                   \
                         output_vec,                                      \
                         input_vec,                                       \
                         ReduceScatterOptions{                            \
@@ -572,7 +572,7 @@ IMPL_ALLTOALL(PrivateUse1)
         HookOpName::ALLTOALL, asyncOp, -1, input, output);                     \
     auto work =                                                                \
         process_group->getBackend(c10::DeviceType::DEV)                        \
-            ->alltoall_base(                                                   \
+            ->all_to_all_single(                                               \
                 output,                                                        \
                 input,                                                         \
                 output_split_sizes,                                            \
