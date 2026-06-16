@@ -1297,19 +1297,12 @@ class TestWrapInductorCompiledRegions(torch._dynamo.test_case.TestCase):
             if node.op == "call_function" and node.target is inductor_compiled_code
         ]
         self.assertEqual(len(hop_nodes), 2)
-        self.assertEqual(
-            getattr(hop_nodes[1].target, "_boxed_call_arg_indices", None), (1,)
-        )
-        self.assertIn(
-            "inductor_compiled_code_1_boxed_arg_1 = [getitem, getitem_1];  "
-            "getitem = getitem_1 = None",
-            gm.code,
-        )
-        self.assertRegex(
-            gm.code,
-            r"torch\.ops\.higher_order\.inductor_compiled_code"
-            r"\(\d+, inductor_compiled_code_1_boxed_arg_1",
-        )
+        target = hop_nodes[1].target
+        self.assertEqual(getattr(target, "_boxed_arg_indices", None), (1,))
+        boxed = "inductor_compiled_code_1_boxed_arg_1 = [getitem, getitem_1];  getitem = getitem_1 = None"
+        self.assertIn(boxed, gm.code)
+        pattern = r"torch\.ops\.higher_order\.inductor_compiled_code\(\d+, inductor_compiled_code_1_boxed_arg_1"
+        self.assertRegex(gm.code, pattern)
         track_lifetime = True
 
         try:

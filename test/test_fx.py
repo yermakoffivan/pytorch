@@ -351,7 +351,7 @@ class TestFX(JitTestCase):
         x, y = torch.rand(1), torch.rand(1)
         self.assertEqual(torch.sin(x + y), gm(x, y))
 
-    def test_boxed_call_arg_indices_codegen(self):
+    def test_boxed_arg_indices_codegen(self):
         def multi_boxed_call(left, passthrough, right):
             return left[0] + left[1] + passthrough + right[0]
 
@@ -361,31 +361,25 @@ class TestFX(JitTestCase):
         c = graph.placeholder("c")
         d = graph.placeholder("d")
         out = graph.call_function(multi_boxed_call, ([a, b], c, [d]))
-        out.meta["boxed_call_arg_indices"] = (0, 2)
+        out.meta["boxed_arg_indices"] = (0, 2)
         graph.output(out)
         gm = GraphModule(torch.nn.Module(), graph)
 
         self.assertEqual(gm(1, 2, 3, 4), 10)
         self.assertIn("multi_boxed_call_boxed_arg_0 = [a, b]", gm.code)
-        self.assertIn(
-            "multi_boxed_call_boxed_arg_2 = [d];  a = b = d = None",
-            gm.code,
-        )
+        self.assertIn("multi_boxed_call_boxed_arg_2 = [d];  a = b = d = None", gm.code)
         self.assertRegex(
             gm.code,
-            r"multi_boxed_call"
-            r"\(multi_boxed_call_boxed_arg_0, c, multi_boxed_call_boxed_arg_2\)",
+            r"multi_boxed_call\(multi_boxed_call_boxed_arg_0, c, multi_boxed_call_boxed_arg_2\)",
         )
-        self.assertIn(
-            "multi_boxed_call_boxed_arg_0 = multi_boxed_call_boxed_arg_2 = None",
-            gm.code,
-        )
+        boxed_arg_cleanup = "multi_boxed_call_boxed_arg_0 = multi_boxed_call_boxed_arg_2 = None"
+        self.assertIn(boxed_arg_cleanup, gm.code)
 
         graph = torch.fx.Graph()
         a = graph.placeholder("a")
         b = graph.placeholder("b")
         out = graph.call_function(multi_boxed_call, ([a, b], a, [b]))
-        out.meta["boxed_call_arg_indices"] = (0, 2)
+        out.meta["boxed_arg_indices"] = (0, 2)
         graph.output(out)
         gm = GraphModule(torch.nn.Module(), graph)
 
@@ -2504,6 +2498,29 @@ class TestFX(JitTestCase):
         graph = torch.fx.Graph()
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
         self.assertEqual(gm(), None)
+
+    def test_complex_constant_codegen_preserves_signed_zero(self):
+        values = [
+            complex(-0.0, -1e-28),
+            complex(-0.0, 1e-28),
+            complex(0.0, -1e-28),
+            complex(1.0, -0.0),
+            complex(0.0, -0.0),
+        ]
+
+        graph = torch.fx.Graph()
+        tensor = graph.call_function(
+            torch.tensor, args=(values,), kwargs={"dtype": torch.complex64}
+        )
+        graph.output(tensor)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        expected = torch.tensor(values, dtype=torch.complex64)
+        result = gm()
+        self.assertEqual(result, expected)
+        self.assertEqual(torch.signbit(result.real), torch.signbit(expected.real))
+        self.assertEqual(torch.signbit(result.imag), torch.signbit(expected.imag))
+        self.assertIn("complex(-0.0, -1e-28)", gm.code)
 
     def test_sequential(self):
         m = torch.nn.Sequential(torch.nn.Conv2d(1, 1, 1))
