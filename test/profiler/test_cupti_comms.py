@@ -6,7 +6,6 @@ schema serializer plugins (FlightRecorder / CommDump / Clog) live in
 ``test_cupti_comms_plugins.py``.
 """
 
-import ctypes
 import json
 import threading
 import time
@@ -34,6 +33,7 @@ def _cupti_version() -> int:
 
 TEST_CUPTI_V13_3 = TEST_CUPTI_PYTHON and _cupti_version() >= 130300
 
+
 @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
 class TestCuptiComms(TestCase):
     def test_comms_observer_correlate_kernels(self):
@@ -47,28 +47,47 @@ class TestCuptiComms(TestCase):
         from torch.profiler._cupti.observers.comms import _correlate_kernels
 
         # kernels: AllReduce (corr 100), an elementwise (corr 200), RS (corr 300).
-        kernels = [(
-            np.array([12, 11, 30], dtype="<i8"),                         # start
-            np.array([20, 15, 40], dtype="<i8"),                         # end
-            np.array([100, 200, 300], dtype="<u8"),                      # correlation_id
-            np.array([7, 0, 8], dtype="<u8"),                            # graph_node
-            np.array(["ncclDevKernel_AllReduce", "vectorized_elementwise",
-                      "ncclDevKernel_ReduceScatter"], dtype=object),     # name
-        )]
+        kernels = [
+            (
+                np.array([12, 11, 30], dtype="<i8"),  # start
+                np.array([20, 15, 40], dtype="<i8"),  # end
+                np.array([100, 200, 300], dtype="<u8"),  # correlation_id
+                np.array([7, 0, 8], dtype="<u8"),  # graph_node
+                np.array(
+                    [
+                        "ncclDevKernel_AllReduce",
+                        "vectorized_elementwise",
+                        "ncclDevKernel_ReduceScatter",
+                    ],
+                    dtype=object,
+                ),  # name
+            )
+        ]
         # Each collective kernel carries its collective's (innermost) external id;
         # the elementwise (corr 200) has no comms tag.
-        ext = [(
-            np.array([42, 43], dtype="<u8"),                            # external_id
-            np.array([100, 300], dtype="<u8"),                         # correlation_id
-        )]
+        ext = [
+            (
+                np.array([42, 43], dtype="<u8"),  # external_id
+                np.array([100, 300], dtype="<u8"),  # correlation_id
+            )
+        ]
 
-        out = sorted(_correlate_kernels(kernels, ext, "nccl"),
-                     key=lambda r: r["external_id"])
+        out = sorted(
+            _correlate_kernels(kernels, ext, "nccl"), key=lambda r: r["external_id"]
+        )
         # corr100->42, corr300->43; the elementwise (corr200, no ext tag and not nccl)
         # is dropped.
         self.assertEqual(len(out), 2)
-        self.assertEqual(out[0], {"external_id": 42, "start_ns": 12, "end_ns": 20,
-                                  "graph_node_id": 7, "name": "ncclDevKernel_AllReduce"})
+        self.assertEqual(
+            out[0],
+            {
+                "external_id": 42,
+                "start_ns": 12,
+                "end_ns": 20,
+                "graph_node_id": 7,
+                "name": "ncclDevKernel_AllReduce",
+            },
+        )
         self.assertEqual(out[1]["external_id"], 43)
         self.assertEqual((out[1]["start_ns"], out[1]["end_ns"]), (30, 40))
 
@@ -80,22 +99,37 @@ class TestCuptiComms(TestCase):
 
         from torch.profiler._cupti.observers.comms import _correlate_kernels
 
-        kernels = [(
-            np.array([10, 30], dtype="<i8"),                       # start
-            np.array([20, 45], dtype="<i8"),                       # end
-            np.array([100, 555], dtype="<u8"),                     # correlation_id
-            np.array([0, 8589934592], dtype="<u8"),                # graph_node
-            np.array(["ncclDevKernel_AllReduce",
-                      "ncclDevKernel_ReduceScatter"], dtype=object),
-        )]
-        ext = [(np.array([42], dtype="<u8"), np.array([100], dtype="<u8"))]  # eager only
+        kernels = [
+            (
+                np.array([10, 30], dtype="<i8"),  # start
+                np.array([20, 45], dtype="<i8"),  # end
+                np.array([100, 555], dtype="<u8"),  # correlation_id
+                np.array([0, 8589934592], dtype="<u8"),  # graph_node
+                np.array(
+                    ["ncclDevKernel_AllReduce", "ncclDevKernel_ReduceScatter"],
+                    dtype=object,
+                ),
+            )
+        ]
+        ext = [
+            (np.array([42], dtype="<u8"), np.array([100], dtype="<u8"))
+        ]  # eager only
 
-        out = sorted(_correlate_kernels(kernels, ext, "nccl"),
-                     key=lambda r: r["graph_node_id"])
+        out = sorted(
+            _correlate_kernels(kernels, ext, "nccl"), key=lambda r: r["graph_node_id"]
+        )
         self.assertEqual(len(out), 2)
         # Eager: external id from the ext record, no graph node.
-        self.assertEqual(out[0], {"external_id": 42, "start_ns": 10, "end_ns": 20,
-                                  "graph_node_id": 0, "name": "ncclDevKernel_AllReduce"})
+        self.assertEqual(
+            out[0],
+            {
+                "external_id": 42,
+                "start_ns": 10,
+                "end_ns": 20,
+                "graph_node_id": 0,
+                "name": "ncclDevKernel_AllReduce",
+            },
+        )
         # Graph replay: no ext record -> external_id 0, keyed by graph_node_id.
         self.assertEqual(out[1]["external_id"], 0)
         self.assertEqual(out[1]["graph_node_id"], 8589934592)
@@ -111,8 +145,16 @@ class TestCuptiComms(TestCase):
 
         in_flight = {42: {"func": "AllReduce", "count": 4096}}
         eager = _join_record(
-            {"external_id": 42, "start_ns": 10, "end_ns": 30, "graph_node_id": 7,
-             "name": "ncclDevKernel_AllReduce"}, in_flight, None)
+            {
+                "external_id": 42,
+                "start_ns": 10,
+                "end_ns": 30,
+                "graph_node_id": 7,
+                "name": "ncclDevKernel_AllReduce",
+            },
+            in_flight,
+            None,
+        )
         self.assertEqual(eager.coll_id, 42)
         self.assertEqual(eager.metadata, {"func": "AllReduce", "count": 4096})
         self.assertEqual(eager.latency_ns, 20)
@@ -120,14 +162,30 @@ class TestCuptiComms(TestCase):
 
         registry = {8: json.dumps({"func": "ReduceScatter"})}
         graph = _join_record(
-            {"external_id": 0, "start_ns": 5, "end_ns": 9, "graph_node_id": 8,
-             "name": "ncclDevKernel_RS"}, {}, registry.get)
+            {
+                "external_id": 0,
+                "start_ns": 5,
+                "end_ns": 9,
+                "graph_node_id": 8,
+                "name": "ncclDevKernel_RS",
+            },
+            {},
+            registry.get,
+        )
         self.assertEqual(graph.coll_id, 8)
         self.assertEqual(graph.metadata, {"func": "ReduceScatter"})
 
         unknown = _join_record(
-            {"external_id": 99, "start_ns": 1, "end_ns": 2, "graph_node_id": 0,
-             "name": "ncclX"}, {}, None)
+            {
+                "external_id": 99,
+                "start_ns": 1,
+                "end_ns": 2,
+                "graph_node_id": 0,
+                "name": "ncclX",
+            },
+            {},
+            None,
+        )
         self.assertEqual(unknown.coll_id, 99)
         self.assertEqual(unknown.metadata, {})
 
@@ -143,11 +201,7 @@ class TestCuptiComms(TestCase):
         import numpy as np
 
         from torch.profiler._cupti.comms import CommRecordPlugin
-        from torch.profiler._cupti.records import (
-            CudaEvent,
-            ExternalCorrelation,
-            Kernel,
-        )
+        from torch.profiler._cupti.records import CudaEvent, ExternalCorrelation, Kernel
 
         calls: list = []
 
@@ -173,16 +227,20 @@ class TestCuptiComms(TestCase):
 
         # Poll 1: the start event (corr 100 -> ext 42) lands while the kernel is still
         # in flight. The EXTERNAL_CORRELATION record maps corr 100 -> ext 42.
-        obs._on_activities({
-            ActivityKind.EXTERNAL_CORRELATION: {
-                int(ExternalCorrelation.EXTERNAL_ID): np.array([42], dtype="<u8"),
-                int(ExternalCorrelation.CORRELATION_ID): np.array([100], dtype="<u8"),
-            },
-            ActivityKind.CUDA_EVENT: {
-                int(CudaEvent.EVENT_ID): np.array([7], dtype="<u8"),
-                int(CudaEvent.CORRELATION_ID): np.array([100], dtype="<u8"),
-            },
-        })
+        obs._on_activities(
+            {
+                ActivityKind.EXTERNAL_CORRELATION: {
+                    int(ExternalCorrelation.EXTERNAL_ID): np.array([42], dtype="<u8"),
+                    int(ExternalCorrelation.CORRELATION_ID): np.array(
+                        [100], dtype="<u8"
+                    ),
+                },
+                ActivityKind.CUDA_EVENT: {
+                    int(CudaEvent.EVENT_ID): np.array([7], dtype="<u8"),
+                    int(CudaEvent.CORRELATION_ID): np.array([100], dtype="<u8"),
+                },
+            }
+        )
         obs.poll()
         # on_schedule fired before on_start; on_end has not (kernel not yet timed).
         self.assertEqual(calls, [("schedule", 42), ("start", 42, "AllReduce")])
@@ -191,19 +249,23 @@ class TestCuptiComms(TestCase):
         # record for the same collective arrives in the same poll AFTER the end loop.
         # on_start must still fire; on_schedule must NOT fire again.
         calls.clear()
-        obs._on_activities({
-            ActivityKind.CONCURRENT_KERNEL: {
-                int(Kernel.START): np.array([10], dtype="<i8"),
-                int(Kernel.END): np.array([20], dtype="<i8"),
-                int(Kernel.CORRELATION_ID): np.array([100], dtype="<u8"),
-                int(Kernel.GRAPH_NODE_ID): np.array([0], dtype="<u8"),
-                int(Kernel.NAME): np.array(["ncclDevKernel_AllReduce"], dtype=object),
-            },
-            ActivityKind.CUDA_EVENT: {
-                int(CudaEvent.EVENT_ID): np.array([7], dtype="<u8"),
-                int(CudaEvent.CORRELATION_ID): np.array([100], dtype="<u8"),
-            },
-        })
+        obs._on_activities(
+            {
+                ActivityKind.CONCURRENT_KERNEL: {
+                    int(Kernel.START): np.array([10], dtype="<i8"),
+                    int(Kernel.END): np.array([20], dtype="<i8"),
+                    int(Kernel.CORRELATION_ID): np.array([100], dtype="<u8"),
+                    int(Kernel.GRAPH_NODE_ID): np.array([0], dtype="<u8"),
+                    int(Kernel.NAME): np.array(
+                        ["ncclDevKernel_AllReduce"], dtype=object
+                    ),
+                },
+                ActivityKind.CUDA_EVENT: {
+                    int(CudaEvent.EVENT_ID): np.array([7], dtype="<u8"),
+                    int(CudaEvent.CORRELATION_ID): np.array([100], dtype="<u8"),
+                },
+            }
+        )
         obs.poll()
         # end fired; the late start still fired (no second schedule). Its metadata is
         # empty: the in-flight entry was cleared by on_end before the start processed.
@@ -232,23 +294,28 @@ class TestCuptiComms(TestCase):
             def on_start(self, coll_id, metadata):
                 calls.append((coll_id, metadata.get("func")))
 
-        obs = self._bare_observer(event_resolver=lambda eid: role if eid == 99 else None)
+        obs = self._bare_observer(
+            event_resolver=lambda eid: role if eid == 99 else None
+        )
         obs.add_plugin(_Recorder())
 
-        obs._on_activities({
-            ActivityKind.CUDA_EVENT: {
-                int(CudaEvent.EVENT_ID): np.array([99], dtype="<u8"),
-                # No EXTERNAL_CORRELATION for graph replay -> no corr->ext mapping, so
-                # the eager branch misses and the resolver is used. Correlation id is a
-                # fresh runtime id with no ext record.
-                int(CudaEvent.CORRELATION_ID): np.array([555], dtype="<u8"),
-            },
-        })
+        obs._on_activities(
+            {
+                ActivityKind.CUDA_EVENT: {
+                    int(CudaEvent.EVENT_ID): np.array([99], dtype="<u8"),
+                    # No EXTERNAL_CORRELATION for graph replay -> no corr->ext mapping, so
+                    # the eager branch misses and the resolver is used. Correlation id is a
+                    # fresh runtime id with no ext record.
+                    int(CudaEvent.CORRELATION_ID): np.array([555], dtype="<u8"),
+                },
+            }
+        )
         obs.poll()
         self.assertEqual(calls, [(5, "ReduceScatter")])
         # The graph start is recorded in the observer's in-flight accounting: collective
         # 5 has an outstanding start (no kernel completion fed yet), so it is in flight.
         self.assertEqual(obs.in_flight(), {5: {"func": "ReduceScatter"}})
+
     def test_comm_monitor_hook(self):
         # The native torchcomms-hook integration: a
         # pre-hook pushes the external-corr id and records host-side metadata
@@ -396,6 +463,7 @@ class TestCuptiComms(TestCase):
         comm.all_reduce(t)
         self.assertEqual(len(mon.added[0]["frames"]), 1)
         self.assertEqual(mon.added[0]["frames"][0]["name"], "all_reduce")
+
     def test_quiescence_stall_trips_hang_detector(self):
         # The observer's quiescence model: when no lifecycle callback has fired for the
         # timeout while collectives are still in flight, the background tick publishes the
@@ -446,10 +514,15 @@ class TestCuptiComms(TestCase):
         obs._scheduled = {7}  # issued earlier (its on_schedule already fired, not now)
         # 7's completion is delivered only by the flush (undelivered until then).
         obs.drain_collectives = lambda flush=False: (
-            [{
-                "external_id": 7, "start_ns": 1, "end_ns": 2, "graph_node_id": 0,
-                "name": "ncclDevKernel_AllReduce",
-            }]
+            [
+                {
+                    "external_id": 7,
+                    "start_ns": 1,
+                    "end_ns": 2,
+                    "graph_node_id": 0,
+                    "name": "ncclDevKernel_AllReduce",
+                }
+            ]
             if flush
             else []
         )
@@ -505,10 +578,20 @@ class TestCuptiComms(TestCase):
         # Replay 1: both collectives start (events 10, 20) and both kernels complete.
         obs._cuda_events = [([10, 20], [0, 0])]
         obs.drain_collectives = lambda flush=False: [
-            {"external_id": 0, "start_ns": 1, "end_ns": 2, "graph_node_id": 100,
-             "name": "ncclDevKernel_AllReduce"},
-            {"external_id": 0, "start_ns": 1, "end_ns": 2, "graph_node_id": 200,
-             "name": "ncclDevKernel_Reduce"},
+            {
+                "external_id": 0,
+                "start_ns": 1,
+                "end_ns": 2,
+                "graph_node_id": 100,
+                "name": "ncclDevKernel_AllReduce",
+            },
+            {
+                "external_id": 0,
+                "start_ns": 1,
+                "end_ns": 2,
+                "graph_node_id": 200,
+                "name": "ncclDevKernel_Reduce",
+            },
         ]
         obs.poll()
         self.assertEqual(obs.in_flight(), {})  # all kernels caught up
@@ -516,8 +599,13 @@ class TestCuptiComms(TestCase):
         # Replay 2: both start again, but collective 2's kernel (200) never completes.
         obs._cuda_events = [([10, 20], [0, 0])]
         obs.drain_collectives = lambda flush=False: [
-            {"external_id": 0, "start_ns": 3, "end_ns": 4, "graph_node_id": 100,
-             "name": "ncclDevKernel_AllReduce"},
+            {
+                "external_id": 0,
+                "start_ns": 3,
+                "end_ns": 4,
+                "graph_node_id": 100,
+                "name": "ncclDevKernel_AllReduce",
+            },
         ]
         obs.poll()
         self.assertEqual(set(obs.in_flight()), {2})  # collective 2 outstanding
@@ -535,7 +623,6 @@ class TestCuptiComms(TestCase):
         # A CommsObserver with its state set up but NOT registered with the monitor
         # (no CUDA), so _on_activities + poll + _quiescence_tick can be driven host-side.
         import collections
-        import threading
         import time
 
         from torch.profiler._cupti.observers.comms import CommsObserver
@@ -569,6 +656,7 @@ class TestCuptiComms(TestCase):
         obs._past = collections.deque(maxlen=16)
         obs._plugins = []
         return obs
+
     def test_observer_plugin_lifecycle_order(self):
         # The per-collective lifecycle dispatch in poll(): each collective gets
         # on_schedule exactly once and always before its on_end (even when issued+
@@ -600,19 +688,28 @@ class TestCuptiComms(TestCase):
         # flight. The completed one must get schedule-before-end; the in-flight one is
         # scheduled after the completion loop. poll() never fires on_progress.
         obs._in_flight = {7: {"func": "AllReduce"}, 8: {"func": "Reduce"}}
-        completed = [{
-            "external_id": 7, "start_ns": 10, "end_ns": 20, "graph_node_id": 0,
-            "name": "ncclDevKernel_AllReduce",
-        }]
+        completed = [
+            {
+                "external_id": 7,
+                "start_ns": 10,
+                "end_ns": 20,
+                "graph_node_id": 0,
+                "name": "ncclDevKernel_AllReduce",
+            }
+        ]
         obs.drain_collectives = lambda flush=False: completed
         recs = obs.poll()
 
         self.assertEqual(len(recs), 1)
         self.assertEqual(recs[0].coll_id, 7)
-        self.assertEqual(calls, [
-            ("schedule", 7), ("end", 7),  # schedule-before-end for the same-poll one
-            ("schedule", 8),              # still-in-flight scheduled after the loop
-        ])
+        self.assertEqual(
+            calls,
+            [
+                ("schedule", 7),
+                ("end", 7),  # schedule-before-end for the same-poll one
+                ("schedule", 8),  # still-in-flight scheduled after the loop
+            ],
+        )
         self.assertNotIn("start", [c[0] for c in calls])  # no start events fed
         self.assertNotIn("progress", [c[0] for c in calls])  # poll() never emits it
 
@@ -624,19 +721,24 @@ class TestCuptiComms(TestCase):
 
         # Poll 3: 8 completes -> end only (it was scheduled in poll 1).
         calls.clear()
-        obs.drain_collectives = lambda flush=False: [{
-            "external_id": 8, "start_ns": 30, "end_ns": 50, "graph_node_id": 0,
-            "name": "ncclDevKernel_Reduce",
-        }]
+        obs.drain_collectives = lambda flush=False: [
+            {
+                "external_id": 8,
+                "start_ns": 30,
+                "end_ns": 50,
+                "graph_node_id": 0,
+                "name": "ncclDevKernel_Reduce",
+            }
+        ]
         obs.poll()
         self.assertEqual(calls, [("end", 8)])
         self.assertEqual(obs.in_flight(), {})
+
     def test_collective_wait_side_channel(self):
         # The comms hook owns the CPU-wait channel (not the generic monitor): the
         # per-work wait hook records waited-on external ids via _note_wait on the
         # (arbitrary) waiting thread; drain_waits swaps them out on the poll thread.
         # Thread-safe -- waits from worker threads all surface in one drain. Host-side.
-        import threading
 
         from torch.profiler._cupti.comms import CommMonitorHook
 
@@ -668,11 +770,8 @@ class TestCuptiComms(TestCase):
         # on_wait(eid, metadata) per wait occurrence, resolving metadata from the
         # recent-metadata cache that on_schedule/on_end seed (so a wait arriving after
         # completion still has it). Drive poll() with a fake wait source -- host-side.
-        import collections
-        import threading
 
         from torch.profiler._cupti.comms import CommRecordPlugin
-        from torch.profiler._cupti.observers.comms import CommsObserver
 
         calls: list = []
 
@@ -705,10 +804,15 @@ class TestCuptiComms(TestCase):
         # and a wait on it recorded the same poll -> on_wait fires with the metadata.
         meta = {"func": "AllReduce", "coll_id": 5}
         obs._in_flight = {5: meta}
-        obs.drain_collectives = lambda flush=False: [{
-            "external_id": 5, "start_ns": 1, "end_ns": 9, "graph_node_id": 0,
-            "name": "ncclDevKernel_AllReduce",
-        }]
+        obs.drain_collectives = lambda flush=False: [
+            {
+                "external_id": 5,
+                "start_ns": 1,
+                "end_ns": 9,
+                "graph_node_id": 0,
+                "name": "ncclDevKernel_AllReduce",
+            }
+        ]
         pending_waits[:] = [5]
         obs.poll()
         self.assertIn(("wait", 5, meta), calls)
@@ -727,8 +831,6 @@ class TestCuptiComms(TestCase):
             [c for c in calls if c[0] == "wait"],
             [("wait", 5, meta), ("wait", 5, meta), ("wait", 999, {})],
         )
-
-
 
 
 @unittest.skipIf(not TEST_CUDA, "CUDA required")
@@ -784,6 +886,7 @@ class TestCuptiCommsCUDA(TestCase):
         self.assertEqual(len(obs.in_flight()), 0)
         self.assertEqual(len(obs.past()), len(records))
         self.assertEqual(seen, records)  # the plugin saw every completed record
+
 
 if __name__ == "__main__":
     run_tests()

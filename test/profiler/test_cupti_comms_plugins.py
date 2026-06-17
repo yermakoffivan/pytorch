@@ -6,10 +6,7 @@ service-specific serializers (torchcomms clog, ncclx comm_dump) live with their
 consumers, not in core.
 """
 
-import ctypes
 import json
-import threading
-import time
 import unittest
 
 import torch
@@ -34,6 +31,7 @@ def _cupti_version() -> int:
 
 TEST_CUPTI_V13_3 = TEST_CUPTI_PYTHON and _cupti_version() >= 130300
 
+
 @unittest.skipIf(not TEST_CUPTI_PYTHON, "requires cupti-python")
 class TestCuptiCommsPlugins(TestCase):
     def test_flight_recorder_plugin(self):
@@ -47,10 +45,15 @@ class TestCuptiCommsPlugins(TestCase):
         plugin = FlightRecorderPlugin(comm_lib_version="nccl-2.99")
 
         meta = {
-            "func": "AllReduce", "datatype": "ncclBfloat16", "count": 1024, "seq": 7,
+            "func": "AllReduce",
+            "datatype": "ncclBfloat16",
+            "count": 1024,
+            "seq": 7,
             # backend-supplied schema fields (via the metadata store):
-            "process_group": ["0", "default"], "process_group_ranks": [0, 1],
-            "input_sizes": [[1024]], "output_sizes": [[1024]],
+            "process_group": ["0", "default"],
+            "process_group_ranks": [0, 1],
+            "input_sizes": [[1024]],
+            "output_sizes": [[1024]],
         }
         # Issued: appears as a scheduled entry (the hang-suspect state).
         plugin.on_schedule(42, meta)
@@ -61,15 +64,23 @@ class TestCuptiCommsPlugins(TestCase):
         self.assertIsNone(sched[0]["duration_ms"])
 
         # Completed: same entry flips to completed with device timing.
-        plugin.on_end(CommRecord(
-            coll_id=42, name="ncclDevKernel_AllReduce", start_ns=1000, end_ns=3000,
-            graph_node_id=0, metadata=meta,
-        ))
+        plugin.on_end(
+            CommRecord(
+                coll_id=42,
+                name="ncclDevKernel_AllReduce",
+                start_ns=1000,
+                end_ns=3000,
+                graph_node_id=0,
+                metadata=meta,
+            )
+        )
         dump = plugin.dump()
 
         self.assertEqual(dump["version"], "2.10")
         self.assertEqual(dump["comm_lib_version"], "nccl-2.99")
-        self.assertEqual(dump["pg_config"]["0"], {"name": "0", "desc": "default", "ranks": "[0, 1]"})
+        self.assertEqual(
+            dump["pg_config"]["0"], {"name": "0", "desc": "default", "ranks": "[0, 1]"}
+        )
         self.assertEqual(dump["pg_status"]["0"]["last_completed_collective"], 7)
         self.assertEqual(len(dump["entries"]), 1)
         e = dump["entries"][0]
@@ -79,11 +90,23 @@ class TestCuptiCommsPlugins(TestCase):
         self.assertEqual(e["duration_ms"], 2000 / 1e6)
         self.assertEqual(e["process_group"], ["0", "default"])
         # Every field the fr_trace analyzer reads is present and JSON-serializable.
-        for key in ("record_id", "pg_id", "process_group", "collective_seq_id",
-                    "p2p_seq_id", "op_id", "profiling_name", "time_created_ns",
-                    "input_sizes", "output_sizes", "state",
-                    "time_discovered_started_ns", "time_discovered_completed_ns",
-                    "retired", "is_p2p"):
+        for key in (
+            "record_id",
+            "pg_id",
+            "process_group",
+            "collective_seq_id",
+            "p2p_seq_id",
+            "op_id",
+            "profiling_name",
+            "time_created_ns",
+            "input_sizes",
+            "output_sizes",
+            "state",
+            "time_discovered_started_ns",
+            "time_discovered_completed_ns",
+            "retired",
+            "is_p2p",
+        ):
             self.assertIn(key, e)
         json.loads(plugin.dump_json())  # round-trips
 
@@ -96,8 +119,12 @@ class TestCuptiCommsPlugins(TestCase):
 
         meta = {"func": "AllReduce", "count": 1024, "seq": 0}
         record = CommRecord(
-            coll_id=42, name="ncclDevKernel_AllReduce", start_ns=1000, end_ns=3000,
-            graph_node_id=0, metadata=meta,
+            coll_id=42,
+            name="ncclDevKernel_AllReduce",
+            start_ns=1000,
+            end_ns=3000,
+            graph_node_id=0,
+            metadata=meta,
         )
 
         plugin = FlightRecorderPlugin(clock_converter=lambda ns: ns + 1_000_000)
@@ -131,26 +158,39 @@ class TestCuptiCommsPlugins(TestCase):
         from torch.profiler._cupti.observers.comms import CommRecord
 
         meta = {
-            "func": "AllReduce", "datatype": "ncclBfloat16", "count": 1024, "seq": 0,
-            "process_group": ["0", "default"], "process_group_ranks": [0, 1],
-            "input_sizes": [[1024]], "output_sizes": [[1024]],
+            "func": "AllReduce",
+            "datatype": "ncclBfloat16",
+            "count": 1024,
+            "seq": 0,
+            "process_group": ["0", "default"],
+            "process_group_ranks": [0, 1],
+            "input_sizes": [[1024]],
+            "output_sizes": [[1024]],
         }
 
         def dump_for(rank, completed):
             p = FlightRecorderPlugin()
             p.on_schedule(42, meta)  # scheduled
             if completed:
-                p.on_end(CommRecord(
-                    coll_id=42, name="ncclDevKernel_AllReduce", start_ns=1000,
-                    end_ns=3000, graph_node_id=0, metadata=meta,
-                ))
+                p.on_end(
+                    CommRecord(
+                        coll_id=42,
+                        name="ncclDevKernel_AllReduce",
+                        start_ns=1000,
+                        end_ns=3000,
+                        graph_node_id=0,
+                        metadata=meta,
+                    )
+                )
             d = p.dump()
             d["rank"] = rank
             return d
 
         details = {"0": dump_for(0, True), "1": dump_for(1, False)}
         args = argparse.Namespace(
-            verbose=False, just_print_entries=False, allow_incomplete_ranks=False,
+            verbose=False,
+            just_print_entries=False,
+            allow_incomplete_ranks=False,
             mismatch_cap=10,
         )
         with self.assertLogs("Flight Recorder", level="INFO") as cm:
@@ -177,19 +217,30 @@ class TestCuptiCommsPlugins(TestCase):
         from torch.profiler._cupti.observers.comms import CommRecord
 
         meta = {
-            "func": "AllReduce", "datatype": "ncclBfloat16", "count": 1024, "seq": 0,
-            "process_group": ["0", "default"], "process_group_ranks": [0, 1],
-            "input_sizes": [[1024]], "output_sizes": [[1024]],
+            "func": "AllReduce",
+            "datatype": "ncclBfloat16",
+            "count": 1024,
+            "seq": 0,
+            "process_group": ["0", "default"],
+            "process_group_ranks": [0, 1],
+            "input_sizes": [[1024]],
+            "output_sizes": [[1024]],
         }
 
         def plugin_for(completed):
             p = FlightRecorderPlugin()
             p.on_schedule(42, meta)
             if completed:
-                p.on_end(CommRecord(
-                    coll_id=42, name="ncclDevKernel_AllReduce", start_ns=1000,
-                    end_ns=3000, graph_node_id=0, metadata=meta,
-                ))
+                p.on_end(
+                    CommRecord(
+                        coll_id=42,
+                        name="ncclDevKernel_AllReduce",
+                        start_ns=1000,
+                        end_ns=3000,
+                        graph_node_id=0,
+                        metadata=meta,
+                    )
+                )
             return p
 
         with tempfile.TemporaryDirectory() as d:
@@ -197,8 +248,12 @@ class TestCuptiCommsPlugins(TestCase):
             plugin_for(False).write_dump(rank=1, path=os.path.join(d, "trace_1"))
             self.assertTrue(os.path.exists(p0))
             args = argparse.Namespace(
-                trace_dir=d, prefix="trace_", verbose=False, just_print_entries=False,
-                allow_incomplete_ranks=False, mismatch_cap=10,
+                trace_dir=d,
+                prefix="trace_",
+                verbose=False,
+                just_print_entries=False,
+                allow_incomplete_ranks=False,
+                mismatch_cap=10,
             )
             details, version = read_dir(args)
             self.assertEqual(version, "2.10")
@@ -218,10 +273,7 @@ class TestCuptiCommsPlugins(TestCase):
         import pickle
         import tempfile
 
-        from torch.profiler._cupti.comms import (
-            FlightRecorderPlugin,
-            HangDetectorPlugin,
-        )
+        from torch.profiler._cupti.comms import FlightRecorderPlugin, HangDetectorPlugin
 
         fr = FlightRecorderPlugin()
         # One issued-but-not-completed collective for the dump to capture.
@@ -244,5 +296,7 @@ class TestCuptiCommsPlugins(TestCase):
             os.remove(path)
             hang.on_progress({42: {"func": "AllReduce"}})
             self.assertFalse(os.path.exists(path))
+
+
 if __name__ == "__main__":
     run_tests()
