@@ -3056,6 +3056,10 @@ class _MakefxTracer:
                 raise
 
         if (
+            # TODO: consider running this unconditionally so data-dependent ops
+            # (e.g. ``.item()``, ``nonzero``) get runtime asserts in plain
+            # make_fx traces too, not only when an explicit ``dynamic_shapes``
+            # spec or a HOP subgraph is involved.
             (self.is_hop_subgraph_tracer() or self.dynamic_shapes is not None)
             and (fake_mode := torch._guards.detect_fake_mode(args))
             and fake_mode.shape_env is not None
