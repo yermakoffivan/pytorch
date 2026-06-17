@@ -106,3 +106,12 @@ runner_mapping:
   linux.rocm.gpu.mi210.2: linux.rocm.gpu.mi210.2
   linux.rocm.gpu.gfx950.1: linux.rocm.gpu.gfx950.1
   linux.rocm.gpu.gfx950.2: linux.rocm.gpu.gfx950.2
+
+
+# H100/B200 hardware exists only on the Meta ARC fleet; pin these labels
+# to the 'mt-' prefix regardless of the build job's fleet assignment.
+always_arc_runners:
+  - linux.aws.h100
+  - linux.aws.h100.4
+  - linux.aws.h100.8
+  - linux.dgx.b200
