@@ -22,11 +22,7 @@ from typing import TYPE_CHECKING
 # module; its absence surfaces as a catchable ModuleNotFoundError for optional
 # consumers (e.g. those probing the monitor import).
 try:
-    from cupti.cupti import (  # pyrefly: ignore[missing-import]
-        Driver_api_trace_cbid,
-        ExternalCorrelationKind,
-        Runtime_api_trace_cbid,
-    )
+    from cupti.cupti import ExternalCorrelationKind  # pyrefly: ignore[missing-import]
 except ModuleNotFoundError as exc:
     raise ModuleNotFoundError(
         "torch.profiler._cupti requires the cupti-python package. "
@@ -45,7 +41,6 @@ LIBCUPTI_PATH_ENV = "TORCH_CUPTI_MONITOR_LIBCUPTI_PATH"
 # CUPTI C-API result/flag constants (cupti_result.h / cupti_activity.h). These
 # are stable ABI values, so they are spelled out rather than resolved.
 CUPTI_SUCCESS = 0
-CUPTI_ERROR_MAX_LIMIT_REACHED = 12
 CUPTI_ACTIVITY_FLAG_FLUSH_FORCED = 1
 
 # CUpti_ActivityAttribute::CUPTI_ACTIVITY_ATTR_USER_DEFINED_RECORDS (not surfaced
@@ -104,29 +99,6 @@ def find_cupti_library() -> str:
     if path is None:
         raise RuntimeError("cuda pathfinder could not resolve a libcupti path")
     return path
-
-
-def disabled_runtime_cbids() -> tuple[int, ...]:
-    """Runtime API callbacks filtered out of activity to cut trace volume."""
-    cbids = Runtime_api_trace_cbid
-    return (
-        cbids.cudaGetDevice_v3020,
-        cbids.cudaSetDevice_v3020,
-        cbids.cudaGetLastError_v3020,
-        cbids.cudaEventCreate_v3020,
-        cbids.cudaEventCreateWithFlags_v3020,
-        cbids.cudaEventDestroy_v3020,
-    )
-
-
-def disabled_driver_cbids() -> tuple[int, ...]:
-    """Driver API callbacks filtered out of activity to cut trace volume."""
-    cbids = Driver_api_trace_cbid
-    return (
-        cbids.cuKernelGetAttribute,
-        cbids.cuDevicePrimaryCtxGetState,
-        cbids.cuCtxGetCurrent,
-    )
 
 
 def _configure_ctypes(lib: ctypes.CDLL) -> None:
