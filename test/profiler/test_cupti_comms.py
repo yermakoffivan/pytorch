@@ -630,6 +630,7 @@ class TestCuptiComms(TestCase):
         obs = CommsObserver.__new__(CommsObserver)
         obs._name_filter = "nccl"
         obs._resolver = None
+        obs._meta_resolver = None
         obs._event_resolver = event_resolver
         obs._wait_source = None
         obs._capture_events = True
