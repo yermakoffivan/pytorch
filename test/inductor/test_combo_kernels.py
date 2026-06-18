@@ -987,15 +987,17 @@ class ComboKernelTests(TestCase):
         # reduction participates in the same occupancy-driven R0_BLOCK scaling as a
         # standalone reduction.
         #
-        # Whether a given kernel actually trips the occupancy heuristic is hardware
-        # dependent: it compares the compiled register count against
-        # regs_per_multiprocessor // max_threads_per_multi_processor, and
-        # max_threads_per_multi_processor differs across GPUs (2048 on
-        # A100/H100/Blackwell vs 1536 on Ada sm_89). To stay deterministic across
-        # backends, capture the combo-reduction autotuner and drive
-        # _iter_rblock_scale_candidates() with a forced register-bound, single-SM
-        # device profile, so candidate generation exercises the combo plumbing
-        # rather than the runner's actual register usage.
+        # Two things would make a naive assertion flaky, so the candidate
+        # generation is driven inside the live compile with a patched device
+        # profile:
+        #   1. Hardware dependence: the occupancy heuristic compares the compiled
+        #      register count against regs_per_multiprocessor //
+        #      max_threads_per_multi_processor, and the latter differs across GPUs
+        #      (2048 on A100/H100/Blackwell vs 1536 on Ada sm_89). A forced
+        #      register-bound, single-SM profile opens both hardware gates anywhere.
+        #   2. Lifecycle: compile_results is cleared once the launchers are built,
+        #      so _iter_rblock_scale_candidates must be exercised during the live
+        #      _dynamic_scale_rblock call, while compile_results is still populated.
         def fn(a, b, c, d):
             r1 = (a * torch.sigmoid(a) + b).sum(dim=1)
             r2 = (c * torch.sigmoid(c) + d).sum(dim=1)
@@ -1007,16 +1009,40 @@ class ComboKernelTests(TestCase):
         from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
         autotuners: list[CachingAutotuner] = []
+        scaled_candidates = []
         orig_init = CachingAutotuner.__init__
+        orig_iter = CachingAutotuner._iter_rblock_scale_candidates
 
         def capture_init(self, *args, **kwargs):
             orig_init(self, *args, **kwargs)
             if (getattr(self, "inductor_meta", {}) or {}).get("combo_grid_meta"):
                 autotuners.append(self)
 
+        def forced_iter(self):
+            # For the combo reduction (size_hints=None), force a register-bound,
+            # single-SM profile so candidate generation is deterministic across
+            # GPUs, then restore the real profile before the caller precompiles.
+            if self.size_hints is None and self._combo_has_reduction_subkernel:
+                orig_props = self.device_props
+                self.device_props = orig_props._replace(
+                    multi_processor_count=1,
+                    max_threads_per_multi_processor=1 << 30,
+                )
+                try:
+                    candidates = list(orig_iter(self))
+                finally:
+                    self.device_props = orig_props
+                scaled_candidates.extend(candidates)
+                yield from candidates
+            else:
+                yield from orig_iter(self)
+
         with (
             fresh_cache(),  # isolate from cache so a re-run (inherited subclass) recompiles
             patch.object(CachingAutotuner, "__init__", capture_init),
+            patch.object(
+                CachingAutotuner, "_iter_rblock_scale_candidates", forced_iter
+            ),
         ):
             torch._dynamo.reset()
             out_compiled = torch.compile(fn)(*inps)
@@ -1030,27 +1056,10 @@ class ComboKernelTests(TestCase):
             combo_reductions,
             "expected a combo reduction kernel with per-subkernel blocks",
         )
-
-        # _could_rblock_scale gates the production path; combo reductions
-        # (size_hints=None) must now pass it.
-        scalable = [au for au in combo_reductions if au._could_rblock_scale]
         self.assertTrue(
-            scalable,
+            any(au._could_rblock_scale for au in combo_reductions),
             "_could_rblock_scale should be True for a combo reduction",
         )
-
-        # Force a register-bound (per-thread register budget rounds to 0) and
-        # occupancy-limited (single SM) profile so both hardware gates open on any
-        # backend; the remaining gates depend only on the chosen Triton config.
-        scaled_candidates = []
-        for au in scalable:
-            forced_props = au.device_props._replace(
-                multi_processor_count=1,
-                max_threads_per_multi_processor=1 << 30,
-            )
-            with patch.object(au, "device_props", forced_props):
-                scaled_candidates.extend(au._iter_rblock_scale_candidates())
-
         self.assertTrue(
             scaled_candidates,
             "_dynamic_scale_rblock should generate a scaled R0_BLOCK candidate "
