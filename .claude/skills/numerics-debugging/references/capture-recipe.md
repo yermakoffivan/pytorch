@@ -1,8 +1,9 @@
 # Capture recipe
 
 Author a throwaway capture script in `agent_space/` that wraps one step in
-`DebugMode` and writes a per-op fingerprint log. Adapt it to the model /
-training loop. Nothing here is committed.
+`DebugMode` and writes a per-op fingerprint log. Adapt it to the model and
+the exact computation being compared: inference, forward+backward, an optimizer
+step, or a larger training-loop step. Nothing here is committed.
 
 Everything below was verified end-to-end on torch 2.10 (CUDA) and the API
 points re-checked on torch 2.13. `torch.utils._debug_mode` is private and
@@ -11,7 +12,9 @@ version-dependent, so **start with the probe**.
 ## Step 1: probe the operator stream (do this first, every time)
 
 The capture hinges on how `dm.operators` represents module boundaries, which
-changes across torch versions. Confirm it before writing the capture:
+changes across torch versions. Confirm it before writing the capture, and check
+whether the target model gets usable layer names without any framework-specific
+setup:
 
 ```python
 import torch, torch.nn as nn
@@ -44,7 +47,7 @@ What this tells you:
   `{'hash': 446.47, 'input_hash': ((7.69, 377.1, 508.4), {})}`).
 - The **module-marker class and its FQN attribute vary by version**. Observed:
   - torch ~2.10: class `_NNModuleCall`, FQN in `.module_name`
-    (e.g. `Net.blocks.0.fc1`), with `.call_depth`.
+    (e.g. `Net.features.0.proj`), with `.call_depth`.
   - torch ~2.13: class `_AnnotateCall` with `header == "nn.Mod"`, FQN in
     `.tag` (e.g. `Sequential.0.fc`), with `.call_depth`.
   Set `MODULE_MARKER` / the FQN getter in the capture below to whatever the
@@ -52,14 +55,19 @@ What this tells you:
 - Module ops appear at `call_depth = marker_depth + 1`, right after their
   marker. Backward ops all sit at `call_depth == 1` with **no** module markers
   -> they need the grad_fn map (below).
+- If the probe or target model has no useful `nn.Mod` / module markers, do not
+  add one-off model-specific labels. Use `annotate_modules=True` in the capture
+  function below to temporarily annotate every `named_modules()` entry with its
+  FQN for this one debug step.
 
 ## Step 2: the capture function (verified working)
 
 ```python
+import contextlib
 import torch
 import torch.nn as nn
 import torch.utils._pytree as pytree
-from torch.utils._debug_mode import DebugMode, _OpCall
+from torch.utils._debug_mode import DebugMode, _OpCall, get_active_debug_mode
 
 # --- set these from the probe output ---
 def is_module_marker(o):
@@ -103,8 +111,37 @@ def _hashstr(h):
     vals = [v for v in pytree.tree_leaves(h) if v is not None]
     return ", ".join(f"{v:.6e}" if isinstance(v, float) else str(v) for v in vals)
 
-def capture(model, run_fn, *, min_numel=0):
-    """run_fn(model) executes one forward (+backward). Returns ordered list of
+@contextlib.contextmanager
+def _annotate_modules(model):
+    """Fallback when DebugMode's built-in module tracker has no usable names."""
+    originals = []
+    root_name = type(model).__name__
+
+    for fqn, mod in model.named_modules():
+        name = fqn or root_name
+        orig = mod.forward
+
+        def wrapped(*args, __orig=orig, __fqn=name, **kwargs):
+            dm = get_active_debug_mode()
+            if dm is None:
+                return __orig(*args, **kwargs)
+            dm._enter_nn_module_call(__fqn, "nn.Mod")
+            try:
+                return __orig(*args, **kwargs)
+            finally:
+                dm._exit_nn_module_call()
+
+        mod.forward = wrapped
+        originals.append((mod, orig))
+
+    try:
+        yield
+    finally:
+        for mod, orig in reversed(originals):
+            mod.forward = orig
+
+def capture(model, run_fn, *, min_numel=0, annotate_modules=False):
+    """run_fn(model) executes the step to compare. Returns ordered list of
     {key, phase, stats, out_hash, in_hash}."""
     # backward FQN map: walk the autograd graph from each module's outputs
     grad_fn_to_fqn = {}
@@ -141,9 +178,17 @@ def capture(model, run_fn, *, min_numel=0):
         if leaves: rec["stats"] = _stats(leaves[0])
         return rec
 
-    dm = DebugMode(record_realtensor=True, record_nn_module=True, record_ids=True)
+    # Prefer DebugMode's built-in module tracking. If the probe shows no usable
+    # markers for the target model, annotate_modules=True installs generic FQN
+    # markers by temporarily wrapping model.named_modules().
+    dm = DebugMode(
+        record_realtensor=True,
+        record_nn_module=not annotate_modules,
+        record_ids=True,
+    )
+    module_ctx = _annotate_modules(model) if annotate_modules else contextlib.nullcontext()
     try:
-        with dm, DebugMode.log_tensor_hashes(hash_fn="norm", hash_inputs=True), \
+        with module_ctx, dm, DebugMode.log_tensor_hashes(hash_fn="norm", hash_inputs=True), \
                 DebugMode.dispatch_hooks(record_hook=record_hook):
             run_fn(model)
     finally:
@@ -194,17 +239,30 @@ Drive it once per run, with identical setup on both sides:
 ```python
 def build():
     torch.manual_seed(0)
-    return Net().cuda(), torch.randn(16, 256, device="cuda")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return Net().to(device), torch.randn(16, 256, device=device)
 
 def step(m, x):
+    # For inference-only comparisons, return or consume m(x) without backward.
     m(x).sum().backward()
 
 m, x = build()
 write_log(capture(m, lambda mm: step(mm, x)), "run_A.log")
-# ... change the one thing under test (compile, FSDP, a flag) ...
+# ... change the one thing under test (compile, a distributed wrapper, a flag) ...
 m, x = build()
 write_log(capture(m, lambda mm: step(mm, x)), "run_B.log")
 ```
+
+If the probe shows missing or framework-specific layer markers, use the generic
+module annotation fallback on both sides:
+
+```python
+write_log(capture(m, lambda mm: step(mm, x), annotate_modules=True), "run_A.log")
+```
+
+Only use `annotate_modules=True` when `record_nn_module=True` is not enough; it
+temporarily monkey-patches `forward` on the model's `named_modules()` entries
+for the captured step and restores them afterwards.
 
 ## Backward FQN attribution
 
@@ -214,7 +272,7 @@ During backward the C++ autograd engine drives execution, so no
 global forward hooks walk the autograd graph from each module's outputs and
 claim unclaimed nodes for that module (`setdefault`, so a parent picks up glue
 ops between children while children keep their own). This was verified to
-recover e.g. `blocks.1.fc2` for a backward `mm`. Ops it can't claim fall back
+recover e.g. `features.1.proj` for a backward `mm`. Ops it can't claim fall back
 to `<backward>`.
 
 ## Compiled / traced runs

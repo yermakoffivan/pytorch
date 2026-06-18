@@ -5,7 +5,7 @@
 This is the exact output `write_log` produces (verified), one block per op:
 
 ```
-[blocks.0.fc1/op_0_addmm]
+[features.0.proj/op_0_addmm]
   Shape: (16, 512) torch.float32
   L2: 5.125471e+01
   Min: -2.010448e+00
@@ -14,7 +14,7 @@ This is the exact output `write_log` produces (verified), one block per op:
   Output hash: 3.691091e+03
   Input hashes: 1.675600e+01, 3.217083e+03, 4.089176e+03
 
-[blocks.0/op_0_relu]
+[features.0/op_0_relu]
   Shape: (16, 512) torch.float32
   L2: 3.630413e+01
   Min: 0.000000e+00
@@ -34,9 +34,9 @@ Notes from real captures:
 - The header `module_fqn/op_N_opname` is the match key. `op_N` is a per-module
   counter, so the same op in two runs gets the same key when the module
   structure matches.
-- `relu` is attributed to the enclosing block (`blocks.0`), not the linear, by
+- `relu` is attributed to the enclosing block (`features.0`), not the linear, by
   the depth-stack reconstruction — that is correct (it is called in
-  `Block.forward`, not inside a submodule).
+  the parent module's `forward`, not inside the linear submodule).
 - The loss `sum` lands under `<none>` (it runs outside any module) and has an
   **empty** `Output hash` (scalar) — expected, skip it.
 - Backward ops carry a trailing `  Phase: backward` line.
@@ -63,7 +63,7 @@ Pair in passes, most specific first, stopping at the first that matches:
 
 1. **Exact key** — identical `module_fqn/op_N_opname`. Strip the model-class
    root prefix on both sides first (FQNs are rooted at the model class, e.g.
-   `Net.blocks.0...`) so the naming agrees with `named_modules()`.
+   `Net.features.0...`) so the naming agrees with `named_modules()`.
 2. **Fuzzy key** — same FQN and op name but a shifted `op_N` counter (one side
    has an extra in-place collective consuming an early slot). Pair by op-name
    order within the module.
@@ -71,6 +71,11 @@ Pair in passes, most specific first, stopping at the first that matches:
    run with everything under `<none>`), pair by dispatch order and confirm
    with matching `Shape` + nearest output hash. Treat these pairings as weaker
    evidence and say so.
+
+If eager logs contain many `<none>` keys, recapture with
+`annotate_modules=True` before using positional matching. Positional matching
+is for cases where module metadata is genuinely unavailable, such as some
+compiled or traced executions.
 
 ## Reading a divergence
 
@@ -88,32 +93,31 @@ Pair in passes, most specific first, stopping at the first that matches:
   the real divergence — report the earliest op in that chain whose inputs
   still matched.
 
-Verified example (fp32 vs TF32 matmul, same seed/dtype/inputs): all 6 forward
-ops matched; the first divergence was a **backward** `mm`
-(`blocks.1.fc2/op_1_mm`) whose two input hashes were identical across runs ->
-the matmul kernel itself is the source. Identical-vs-identical runs reported
-zero divergences across all paired ops (no false positives).
+Verified example (fp32 vs TF32 matmul, same seed/dtype/inputs): all forward
+ops matched; the first divergence was a **backward** `mm` whose two input
+hashes were identical across runs -> the matmul kernel itself is the source.
+Identical-vs-identical runs reported zero divergences across all paired ops
+(no false positives).
 
-## Common eager-vs-traced mismatch patterns
+## Common key mismatch patterns
 
 When comparing eager vs `torch.compile`/`aot_fx_trace`, keys drift for
 structural reasons. Express known correspondences as a manual override map
 (`{run1_key: run2_key}`) applied before the automatic passes; confirm each by
 matching `Shape` and a near-matching output hash first.
 
-- **AC-recompute FQN drift** — selective activation checkpointing re-runs
-  modules on recompute, so one side logs a short FQN (`feed_forward`) while the
-  other keeps the full one (`layers.2.feed_forward`).
-- **Per-layer counter shifts** — an in-place FSDP collective takes an early
-  `op_N` slot under a layer key on one side; the other lacks it, shifting every
-  later op in that layer by one.
-- **Collective lowering / renaming** — eager in-place `_allgather_base_` /
-  `_reduce_scatter_base_` corresponds to a traced
-  `all_gather_into_tensor_out` + `wait_tensor` chain, often re-attributed to
-  the consumer module.
-- **Repeated attention math** — rotary / GQA blocks repeat similar
-  `mul`/`add`/`bmm` patterns, so fuzzy matching can drift by one repeated
-  block.
+- **Recompute FQN drift** — activation checkpointing or another rematerializer
+  re-runs modules, so one side logs a shorter FQN (`submodule`) while the other
+  keeps the full one (`stage.2.submodule`).
+- **Per-module counter shifts** — one side runs an extra bookkeeping,
+  communication, or in-place op under a module key, shifting every later
+  `op_N` in that module by one.
+- **Distributed op lowering / renaming** — an eager collective or device
+  transfer can correspond to a traced chain of lower-level ops, often
+  re-attributed to the consumer module.
+- **Repeated subgraphs** — models with repeated blocks can execute many
+  similar `mul`/`add`/`mm`/`bmm` patterns, so fuzzy matching can drift by one
+  repeated block.
 - **Backward attribution drift** — a backward op can land under `<backward>`,
   a parent module, or a generated backward op name when the grad_fn walk can't
   claim it; pair it explicitly to its eager counterpart.

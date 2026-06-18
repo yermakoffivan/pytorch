@@ -1,6 +1,6 @@
 ---
 name: numerics-debugging
-description: Debug numeric / bitwise divergence between two PyTorch runs that should agree (eager vs torch.compile, eager vs aot_fx_trace, FSDP vs single-GPU, TF32 vs fp32, before vs after a refactor) by capturing per-op activations with torch.utils._debug_mode.DebugMode and diffing them to localize the first diverging op. Use when the user reports loss drift, mismatched outputs, "numerics don't match", "bitwise divergence", "find which op diverges", or invokes /numerics-debugging.
+description: Debug numeric / bitwise divergence between two PyTorch runs that should agree (eager vs torch.compile, eager vs aot_fx_trace, distributed vs single-process, TF32 vs fp32, before vs after a refactor) by capturing per-op activations with torch.utils._debug_mode.DebugMode and diffing them to localize the first diverging op. Use when the user reports loss drift, mismatched outputs, "numerics don't match", "bitwise divergence", "find which op diverges", or invokes /numerics-debugging.
 ---
 
 # Numerics Debugging (DebugMode-based)
@@ -30,7 +30,10 @@ particular how module boundaries are represented) changes across versions:
 
 So the first step is always to run the ~15-line probe in the recipe against
 the *actual* environment, confirm the marker class / attribute names, and
-adapt the capture to match. Do not assume.
+adapt the capture to match. Do not assume. If the probe does not show usable
+layer/module markers for the target model, enable the recipe's generic
+`annotate_modules=True` fallback before capturing; do not rely on framework- or
+model-specific layer-name markers.
 
 ## Workflow
 
@@ -40,11 +43,13 @@ adapt the capture to match. Do not assume.
    before model init and before the step, use the same batch, and enable
    `torch.use_deterministic_algorithms(True)` where possible.
 2. **Probe** the operator stream (recipe, step 1) to confirm the module-marker
-   class for this torch version.
+   class for this torch version and whether `record_nn_module=True` produces
+   useful names for this model.
 3. **Capture one step per run** with the capture function (recipe, step 2),
    writing each run's fingerprints to its own log (`run_A.log`, `run_B.log`).
-   Capture on a warmed-up step if step 0 has legitimate one-time init/compile
-   differences.
+   Pass `annotate_modules=True` when the model needs generic layer annotations.
+   The step can be inference-only or forward+backward; capture on a warmed-up
+   step if step 0 has legitimate one-time init/compile differences.
 4. **Diff the two logs** (recipe, step 3 + [references/comparing-runs.md](references/comparing-runs.md)):
    pair ops by key, parse the hashes as floats, and report the first op whose
    output hash differs beyond a relative tolerance.
@@ -53,7 +58,7 @@ adapt the capture to match. Do not assume.
 
 For each non-excluded op producing a float tensor:
 
-- **Key** `module_fqn/op_N_opname` (e.g. `blocks.0.fc1/op_0_addmm`) — FQN +
+- **Key** `module_fqn/op_N_opname` (e.g. `features.0.proj/op_0_addmm`) — FQN +
   per-module op counter + ATen op name.
 - **Phase** — forward or backward (from `torch._C._current_autograd_node()`).
 - **Output hash** — DebugMode's `norm` hash (~L1, float64) of the result.
@@ -92,9 +97,9 @@ wraps just one step, steady-state training is untouched.
 ## References
 
 - [references/capture-recipe.md](references/capture-recipe.md) — the probe,
-  the verified `DebugMode` capture function (forward FQN via the marker/depth
-  stream, backward FQN via a grad_fn map), op filtering, and the
-  compiled/traced-graph caveat.
+  generic module annotation fallback, the verified `DebugMode` capture function
+  (forward FQN via the marker/depth stream, backward FQN via a grad_fn map), op
+  filtering, and the compiled/traced-graph caveat.
 - [references/comparing-runs.md](references/comparing-runs.md) — the real log
   format, tolerance-based pairing/diffing, and the common eager-vs-traced
   key-drift patterns.
