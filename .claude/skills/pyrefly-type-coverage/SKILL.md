@@ -82,6 +82,15 @@ Examine call sites when the right type isn't obvious from the function body.
 - Always parameterize `Callable` — `Callable[..., Any]` when the signature is
   genuinely unknown, never bare `Callable`. (See ParamSpec below for the
   signature-preserving wrapper case.)
+- Give any module-local global you **introduce** a leading underscore —
+  `TypeVar`/`ParamSpec` (matching the string arg: `_T = TypeVar("_T")`,
+  `_P = ParamSpec("_P")`, `_R = TypeVar("_R")`), `TypeAlias`es, helper constants,
+  and sentinels alike. This is the prevailing torch convention for non-public
+  names (`_P` outnumbers `P` ~6:1 in the tree). Exceptions (leave un-underscored):
+  a name imported by other modules, listed in `__all__`, or used as a runtime
+  token (e.g. an annotation-string dispatch marker). Applies only to names you
+  add — do **not** rename pre-existing globals; that's an unrelated refactor
+  outside this skill's scope.
 - Class attributes assigned in `__init__` should get a class-level annotation so pyrefly can see them.
 - Break import cycles with `if TYPE_CHECKING:` — annotation-only imports go inside the
   guard, and use `from __future__ import annotations` (or string forward refs) so
@@ -150,11 +159,11 @@ wrapper prepends or appends args.
 from collections.abc import Callable
 from typing import ParamSpec, TypeVar
 
-P = ParamSpec("P")
-R = TypeVar("R")
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
-def log_calls(fn: Callable[P, R]) -> Callable[P, R]:
-    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+def log_calls(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
         return fn(*args, **kwargs)
     return wrapper
 ```
