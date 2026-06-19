@@ -292,6 +292,8 @@ int64_t initAndPushDynamicLayer(
       functionalize_add_back_views,
       prev_inference_mode);
   if (prev_inference_mode) {
+    // Snapshot the pre-push keyset so pop can restore it wholesale after
+    // removing the dynamic-layer keys.
     new_layer.interpreter().saveInferenceModeLocalDispatchKeySet(prev_keyset);
   }
   // NB: this function should be called while holding the GIL to avoid races

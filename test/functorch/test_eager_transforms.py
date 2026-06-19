@@ -1209,6 +1209,7 @@ class TestGradTransform(TestCase):
         with torch.inference_mode():
             y = grad(lambda x: (x**2).sum())(x)
         self.assertEqual(y, 2 * x)
+        self.assertNotInferenceTensorAndAutogradUsable(y)
 
     def test_inference_mode_nograd_outside_grad(self, device):
         x = torch.randn(3, device=device)
@@ -1230,6 +1231,7 @@ class TestGradTransform(TestCase):
         with torch.inference_mode():
             _, y = jvp(lambda x: (x**2).sum(), (x,), (t,))
         self.assertEqual(y, (2 * x * t).sum())
+        self.assertNotInferenceTensorAndAutogradUsable(y)
 
     def test_inference_mode_outside_jacrev(self, device):
         x = torch.randn(3, device=device)
