@@ -43,9 +43,7 @@ jobs:
     name: job-filter
     uses: ./.github/workflows/job-filter.yml
     with:
-      # TEMPORARY (testintro iteration only): restrict pull to just the testintro
-      # feature jobs (gcc11 build + test-diff + comment). Restore to '' before landing.
-      jobs-to-include: ${{ github.event.inputs.jobs-to-include || 'test-diff' }}
+      jobs-to-include: ${{ github.event.inputs.jobs-to-include || '' }}
 
   llm-td:
     if: github.repository_owner == 'pytorch'
@@ -72,10 +70,7 @@ jobs:
   # ╠══════════════════════════════════════════════════════════════════════╣
 
   linux-jammy-py3_10-gcc11-build:
-    # TEMPORARY: the ' test-diff ' clause keeps this build alive under the iteration
-    # filter (test-diff reuses it) while the gcc11 test shards stay filtered out.
-    # Remove the ' test-diff ' clause before landing.
-    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' linux-jammy-py3.10-gcc11 ') || contains(needs.job-filter.outputs.jobs, ' test-diff ') }}
+    if: ${{ needs.job-filter.outputs.jobs == '' || contains(needs.job-filter.outputs.jobs, ' linux-jammy-py3.10-gcc11 ') }}
     name: linux-jammy-py3.10-gcc11
     uses: ./.github/workflows/_linux-build.yml
     needs:
@@ -247,18 +242,20 @@ jobs:
       platforms: "linux-cpu,linux-cuda-sm80,linux-cuda-sm90,linux-rocm,macos-mps,linux-xpu"
     secrets: inherit
 
-  # TEMPORARY (pre-land testing only): posts the test-diff comment from the PR branch
-  # with a write token, so the comment path can be validated before
-  # test-diff-comment.yml is on the default branch (workflow_run only runs from there).
-  # Works for same-repo (branch) PRs, e.g. ghstack; forks are skipped here and covered
-  # by test-diff-comment.yml after landing. DELETE THIS JOB BEFORE LANDING.
-  test-diff-comment-testing:
-    name: test-diff-comment (testing)
+  # On-demand pre-land testing of the comment pipeline: post the test-diff comment
+  # directly from the PR branch, instead of the post-land path in test-diff-comment.yml
+  # (workflow_run only ever runs the default-branch copy, so branch changes to the
+  # comment code can't otherwise be exercised before landing). Opt in by putting
+  # `[ci-test-diff-comment]` in the PR description -- for ghstack, in the commit message,
+  # which becomes the PR body and lands as a record that this was tested on-branch.
+  # Same-repo only; forks lack the write token needed to comment.
+  test-diff-comment-on-branch:
+    name: test-diff-comment (on-branch)
     needs:
       - test-diff
       - linux-jammy-py3_10-gcc11-build
       - get-label-type
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false && contains(github.event.pull_request.body, '[ci-test-diff-comment]') }}
     # ARC container job (the classic EC2 pool is not provisioned in ARC mode); the build
     # image just needs python3 -- post_comment is urllib-only and imports no torch.
     runs-on: "${{ needs.get-label-type.outputs.label-type }}l-x86iavx512-8-64"
@@ -285,8 +282,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        # Check the file in-container; hashFiles() (host-evaluated) doesn't see the
-        # artifact written into the ARC container workspace, so it would skip wrongly.
         run: |
           if [ -f test-diff-result.json ]; then
             python3 -m tools.testing.introspection.post_comment test-diff-result.json
