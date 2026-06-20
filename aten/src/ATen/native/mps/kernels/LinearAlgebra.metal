@@ -1292,7 +1292,6 @@ kernel void svd_jacobi(
     uint3 tg_pos [[threadgroup_position_in_grid]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-
   const uint32_t tid = thread_pos.x;
   const uint32_t group_size = tpg.x;
   const uint32_t m = params.m;
@@ -1330,7 +1329,7 @@ kernel void svd_jacobi(
   constexpr auto eps = numeric_limits<float>::epsilon();
   // Concurrent SIMD-groups flag "I rotated"; a plain flag races, so use an
   // atomic.
-  threadgroup ::metal::atomic_uint any_rotation;
+  threadgroup atomic_uint any_rotation;
 
   // Round-robin tournament pairing (closed-form circle method): pad to even ne;
   // each sweep is ne-1 rounds of ne/2 disjoint pairs; index >= n is phantom.
@@ -1382,7 +1381,7 @@ kernel void svd_jacobi(
           continue;
         }
         if (simd_lane == 0) {
-         atomic_store_explicit(&any_rotation, 1u, memory_order_relaxed);
+          atomic_store_explicit(&any_rotation, 1u, memory_order_relaxed);
         }
         T phi = (apq_abs > 0) ? (apq_acc * (1.0f / apq_abs)) : svd_one(T(0));
         float tau = (aqq - app) / (2 * apq_abs);
@@ -1428,7 +1427,8 @@ kernel void svd_jacobi(
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     threadgroup uint32_t do_break = 0;
     if (tid == 0) {
-      do_break = ::metal::atomic_load_explicit(&any_rotation, ::metal::memory_order_relaxed) == 0u;
+      do_break =
+          atomic_load_explicit(&any_rotation, memory_order_relaxed) == 0u;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (do_break) {
@@ -1596,7 +1596,7 @@ kernel void eigh_jacobi(
   threadgroup uint32_t pbuf[48], qbuf[48];
   // Concurrent SIMD-groups flag "I rotated"; a plain flag races, so use an
   // atomic.
-  threadgroup ::metal::atomic_uint any_rotation;
+  threadgroup atomic_uint any_rotation;
 
   const uint32_t ne = n + (n & 1u);
   const uint32_t n_pairs = ne / 2;
@@ -1616,9 +1616,9 @@ kernel void eigh_jacobi(
         uint32_t row = i % n, col = i / n;
         float a2 = svd_abs2(Atg[i]);
         if (row == col) {
-          ld = ::metal::max(ld, a2);
+          ld = max(ld, a2);
         } else {
-          lo = ::metal::max(lo, a2);
+          lo = max(lo, a2);
         }
       }
       ld = c10::metal::simd_max(ld);
@@ -1632,10 +1632,10 @@ kernel void eigh_jacobi(
     float g2 = 0.0f;
     float o2 = 0.0f;
     for (uint32_t s = 0; s < num_sg; ++s) {
-      g2 = ::metal::max(g2, red_diag[s]);
-      o2 = ::metal::max(o2, red_off[s]);
+      g2 = max(g2, red_diag[s]);
+      o2 = max(o2, red_off[s]);
     }
-    const float gscale = ::metal::precise::sqrt(g2);
+    const float gscale = precise::sqrt(g2);
     if (o2 <= params.tol * params.tol * g2) {
       break;
     }
