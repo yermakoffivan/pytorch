@@ -1241,6 +1241,10 @@ class TestFX(JitTestCase):
         self.assertIsInstance(traced_output[2], collections.OrderedDict)
         self.assertEqual(list(traced_output[2].keys()), ["out1", "out2"])
 
+        scripted_output = torch.jit.script(traced)(x)
+        self.assertEqual(scripted_output[2]["out1"], traced_output[2]["out1"])
+        self.assertEqual(scripted_output[2]["out2"], traced_output[2]["out2"])
+
         optimized = optimization.optimize_for_inference(
             M().eval(),
             {
@@ -1311,6 +1315,7 @@ class TestFX(JitTestCase):
         x = torch.randn(3)
         traced = symbolic_trace(M())
         traced.graph.lint()
+        self.assertNotIn("torch.jit.is_scripting", traced.code)
         traced_output = traced(x)
         self.assertIsInstance(traced_output, collections.OrderedDict)
         self.assertEqual(list(traced_output.keys()), [(1, 2)])
@@ -1328,6 +1333,33 @@ class TestFX(JitTestCase):
         self.assertEqual(list(deepcopy_output.keys()), [(1, 2)])
         self.assertIsInstance(loaded_output, collections.OrderedDict)
         self.assertEqual(list(loaded_output.keys()), [(1, 2)])
+
+        object_key = object()
+
+        class ObjectKeyModule(torch.nn.Module):
+            def forward(self, x):
+                return collections.OrderedDict([(object_key, x + 1)])
+
+        traced_object_key = symbolic_trace(ObjectKeyModule())
+        object_key_output = traced_object_key(x)
+        self.assertIsInstance(object_key_output, collections.OrderedDict)
+        self.assertIs(next(iter(object_key_output.keys())), object_key)
+        self.assertEqual(object_key_output[object_key], x + 1)
+        self.assertNotIn("torch.jit.is_scripting", traced_object_key.code)
+
+        class MixedKeyModule(torch.nn.Module):
+            def forward(self, x):
+                return collections.OrderedDict([(1, x + 1), ("two", x + 2)])
+
+        traced_mixed_key = symbolic_trace(MixedKeyModule())
+        self.assertNotIn("torch.jit.is_scripting", traced_mixed_key.code)
+
+        class MinIntKeyModule(torch.nn.Module):
+            def forward(self, x):
+                return collections.OrderedDict([(-(2**63), x + 1)])
+
+        traced_min_int_key = symbolic_trace(MinIntKeyModule())
+        self.assertNotIn("torch.jit.is_scripting", traced_min_int_key.code)
 
     def test_tensor_constant(self):
         class ConstTensor(torch.nn.Module):
