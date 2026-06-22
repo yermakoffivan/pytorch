@@ -31,6 +31,7 @@ from ._utils import _get_device_index
 from .graphs import (
     CUDAGraph,
     export_dot,
+    export_graph_data,
     graph,
     graph_pool_handle,
     is_current_stream_capturing,
@@ -2116,6 +2117,7 @@ __all__ = [
     "device_of",
     "empty_cache",
     "export_dot",
+    "export_graph_data",
     "get_allocator_backend",
     "CUDAPluggableAllocator",
     "change_current_allocator",

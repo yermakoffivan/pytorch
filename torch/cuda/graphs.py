@@ -39,6 +39,7 @@ __all__ = [
     "graph",
     "make_graphed_callables",
     "export_dot",
+    "export_graph_data",
 ]
 
 
@@ -512,6 +513,22 @@ def export_dot(path: str, *, verbose: bool = True) -> Callable[[CUDAGraph], None
 
     def _hook(cuda_graph: CUDAGraph) -> None:
         _dump_graph_dot(cuda_graph, path, verbose=verbose)
+
+    return _hook
+
+
+def export_graph_data(path: str) -> Callable[[CUDAGraph], None]:
+    r"""Return a post-instantiate hook that pickles :meth:`CUDAGraph.get_graph_data`
+    to ``path``. Register it with :meth:`CUDAGraph.register_post_instantiate_hook`:
+    ``get_graph_data`` needs the graph instantiated (it remaps node ids to the
+    exec graph id), and at post-instantiate time the template is still live, so
+    this works for both ``keep_graph`` modes."""
+
+    def _hook(cuda_graph: CUDAGraph) -> None:
+        import pickle
+
+        with open(path, "wb") as f:
+            pickle.dump(cuda_graph.get_graph_data(), f)
 
     return _hook
 
