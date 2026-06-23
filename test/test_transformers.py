@@ -1605,9 +1605,10 @@ class TestSDPAFailureModes(NNTestCase):
         v = torch.randn(2, 4, 8, 16, device=device)
         attn_mask = torch.zeros(8, 8, device=device)
 
+        expected_error = "_scaled_dot_product_attention: Explicit attn_mask should not be set when is_causal=True"
         context = contextlib.nullcontext() if backend is None else sdpa_kernel(backends=[backend])
         with context:
-            with self.assertRaisesRegex(RuntimeError, "Explicit attn_mask should not be set when is_causal=True"):
+            with self.assertRaisesRegex(RuntimeError, expected_error):
                 F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=True)
 
     @onlyCUDA

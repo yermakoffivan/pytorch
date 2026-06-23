@@ -533,7 +533,7 @@ inline void validate_sdpa_input(
   if (attn_mask_.has_value()){
     TORCH_CHECK(
       !is_causal,
-      "Explicit attn_mask should not be set when is_causal=True");
+      "_scaled_dot_product_attention: Explicit attn_mask should not be set when is_causal=True");
     auto mask_dtype = attn_mask_->dtype();
     TORCH_CHECK(mask_dtype == at::kBool || mask_dtype == at::kFloat || mask_dtype == query_.dtype(),
       "Expected attn_mask dtype to be bool or float or to match query dtype, but got attn_mask.dtype: ",
