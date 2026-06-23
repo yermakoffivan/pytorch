@@ -4089,6 +4089,47 @@ class AssociativeScanTests(TestCase):
                 inputs=x,
             )
 
+    def test_associative_scan_pointwise_cpu_lowering_error(self):
+        # The device constraint for pointwise associative_scan is enforced in the
+        # Inductor lowering (the default CPU backend lacks scan support), not the
+        # eager wrapper. The check fires before any codegen, so no GPU is
+        # required. See https://github.com/pytorch/pytorch/issues/186594.
+        def combine_fn(x, y):
+            return x + y
+
+        class M(torch.nn.Module):
+            def forward(self, xs):
+                return associative_scan(combine_fn, xs, dim=0, combine_mode="pointwise")
+
+        from torch._inductor.exc import InductorError
+
+        xs = torch.randn(8, 4)
+        with self.assertRaisesRegex(InductorError, "is not supported on cpu"):
+            torch.compile(M(), fullgraph=True)(xs)
+
+    @unittest.skipIf(not SM70OrLater, "triton")
+    @requires_cuda
+    def test_associative_scan_pointwise_mixed_device_lowering_error(self):
+        # The lowering checks every leaf's device, not just the first, so a
+        # multi-leaf input with an unsupported-device leaf is rejected even when
+        # the first leaf is on a supported device. See
+        # https://github.com/pytorch/pytorch/issues/186594.
+        def combine_fn(x, y):
+            return (x[0] + y[0], x[1] + y[1])
+
+        class M(torch.nn.Module):
+            def forward(self, a, b):
+                return associative_scan(
+                    combine_fn, (a, b), dim=0, combine_mode="pointwise"
+                )
+
+        from torch._inductor.exc import InductorError
+
+        a = torch.randn(8, 4, device="cuda")
+        b = torch.randn(8, 4, device="cpu")
+        with self.assertRaisesRegex(InductorError, "is not supported on cpu"):
+            torch.compile(M(), fullgraph=True)(a, b)
+
     @unittest.skipIf(not SM70OrLater, "triton")
     @requires_cuda
     @parametrize("compile_mode", ["none", "eager", "compile", "compile_dynamic_shape"])
