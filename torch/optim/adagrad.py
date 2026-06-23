@@ -381,7 +381,12 @@ def _single_tensor_adagrad(
     if grad_scale is not None or found_inf is not None:
         raise AssertionError("Expected grad_scale and found_inf to be None")
 
-    if not torch.jit.is_scripting():
+    if torch.jit.is_scripting():
+        # JIT does not realize the ops below have overloads for both float and
+        # Tensor lr, so narrow to float (scripted callers always pass a float).
+        if not isinstance(lr, float):
+            raise AssertionError(f"Expected lr to be a float, but got {type(lr)}")
+    else:
         lr = _to_scalar(lr)
 
     for param, grad, state_sum, step_t in zip(

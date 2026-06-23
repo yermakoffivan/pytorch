@@ -240,7 +240,12 @@ def _single_tensor_adamax(
     capturable: bool,
     has_complex: bool,
 ) -> None:
-    if not torch.jit.is_scripting():
+    if torch.jit.is_scripting():
+        # JIT does not realize the ops below have overloads for both float and
+        # Tensor lr, so narrow to float (scripted callers always pass a float).
+        if not isinstance(lr, float):
+            raise AssertionError(f"Expected lr to be a float, but got {type(lr)}")
+    else:
         lr = _to_scalar(lr)
 
     for i, param in enumerate(params):

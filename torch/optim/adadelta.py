@@ -272,7 +272,12 @@ def _single_tensor_adadelta(
                 f"If capturable=True, params and state_steps must be on supported devices: {capturable_supported_devices}."
             )
 
-    if not torch.jit.is_scripting():
+    if torch.jit.is_scripting():
+        # JIT does not realize the ops below have overloads for both float and
+        # Tensor lr, so narrow to float (scripted callers always pass a float).
+        if not isinstance(lr, float):
+            raise AssertionError(f"Expected lr to be a float, but got {type(lr)}")
+    else:
         lr = _to_scalar(lr)
 
     for param, grad, square_avg, acc_delta, step in zip(
