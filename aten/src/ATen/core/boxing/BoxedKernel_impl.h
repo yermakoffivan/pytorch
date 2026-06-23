@@ -90,8 +90,7 @@ inline BoxedKernel BoxedKernel::makeFromFunctor(
       std::is_base_of_v<OperatorKernel, KernelFunctor>,
       "Tried to call BoxedKernel::makeFromFunctor<KernelFunctor>, but the functor doesn't inherit from c10::OperatorKernel. Please have the functor inherit from it.");
   return BoxedKernel(
-      std::move(kernelFunctor),
-      &make_boxed_functor<KernelFunctor>);
+      std::move(kernelFunctor), &make_boxed_functor<KernelFunctor>);
 }
 
 inline OperatorKernel* BoxedKernel::getFunctor() const {

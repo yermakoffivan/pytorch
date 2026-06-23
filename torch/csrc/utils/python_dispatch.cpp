@@ -3,6 +3,7 @@
 
 #include <ATen/DTensorState.h>
 #include <ATen/FunctionalTensorWrapper.h>
+#include <ATen/PythonTorchFunctionTLS.h>
 #include <ATen/TensorSubclassLikeUtils.h>
 #include <ATen/autocast_mode.h>
 #include <ATen/core/NestedIntSymNodeImpl.h>
@@ -17,6 +18,7 @@
 #include <torch/csrc/autograd/autograd_not_implemented_fallback.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
+#include <torch/csrc/utils/disable_torch_function.h>
 #include <torch/csrc/utils/tensor_new.h>
 
 #include <c10/util/Synchronized.h>
@@ -308,19 +310,16 @@ static bool pyobject_dispatch_try_normalize_args(
       return false;
     }
 
-    PyObject* list = args[i];
-    if (!PyList_CheckExact(list)) {
-      list = PySequence_List(list);
-      if (list == nullptr) {
-        PyErr_Clear();
-        return false;
-      }
-      if (normalized_args.empty()) {
-        normalized_args.assign(args, args + nargs);
-      }
-      normalized_args[i] = list;
-      owned_args.emplace_back(py::reinterpret_steal<py::object>(list));
+    PyObject* list = PySequence_List(args[i]);
+    if (list == nullptr) {
+      PyErr_Clear();
+      return false;
     }
+    if (normalized_args.empty()) {
+      normalized_args.assign(args, args + nargs);
+    }
+    normalized_args[i] = list;
+    owned_args.emplace_back(py::reinterpret_steal<py::object>(list));
     for (Py_ssize_t j = 0; j < PyList_GET_SIZE(list); ++j) {
       if (!THPVariable_Check(PyList_GET_ITEM(list, j))) {
         return false;
@@ -328,6 +327,45 @@ static bool pyobject_dispatch_try_normalize_args(
     }
   }
   return true;
+}
+
+static bool pyobject_dispatch_arg_has_torch_function(PyObject* arg) {
+  if (THPVariable_CheckExact(arg)) {
+    return false;
+  }
+  if (PyList_CheckExact(arg) || PyTuple_CheckExact(arg)) {
+    const Py_ssize_t len = PySequence_Fast_GET_SIZE(arg);
+    PyObject** items = PySequence_Fast_ITEMS(arg);
+    for (Py_ssize_t i = 0; i < len; ++i) {
+      if (pyobject_dispatch_arg_has_torch_function(items[i])) {
+        return true;
+      }
+    }
+    return false;
+  }
+  return torch::check_has_torch_function(arg, /*ignore_mode=*/true);
+}
+
+static bool pyobject_dispatch_has_torch_function(
+    PyObject* const* args,
+    Py_ssize_t nargs,
+    Py_ssize_t nkwargs,
+    Py_ssize_t op_args_start) {
+  if (!torch::torch_function_enabled()) {
+    return false;
+  }
+  if (torch::consume_should_skip_torch_function()) {
+    return false;
+  }
+  if (at::impl::torch_function_mode_enabled()) {
+    return true;
+  }
+  for (Py_ssize_t i = op_args_start; i < nargs + nkwargs; ++i) {
+    if (pyobject_dispatch_arg_has_torch_function(args[i])) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static PyObject* pyobject_dispatch_call_redispatch_cpp(
@@ -446,6 +484,12 @@ static PyObject* pyobject_dispatch_vectorcall(
     PyObject* kwnames) {
   auto* self = reinterpret_cast<PyObjectDispatchFunc*>(callable);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+  Py_ssize_t nkwargs = kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames);
+  if (C10_UNLIKELY(
+          pyobject_dispatch_has_torch_function(args, nargs, nkwargs, 0))) {
+    return PyObject_Vectorcall(
+        self->cpp_dispatch_fn, args, static_cast<size_t>(nargs), kwnames);
+  }
   c10::SmallVector<PyObject*, 64> normalized_args;
   std::vector<py::object> owned_args;
   if (!pyobject_dispatch_try_normalize_args(
@@ -473,6 +517,12 @@ static PyObject* pyobject_redispatch_vectorcall(
     PyObject* kwnames) {
   auto* self = reinterpret_cast<PyObjectRedispatchFunc*>(callable);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+  Py_ssize_t nkwargs = kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames);
+  if (C10_UNLIKELY(
+          pyobject_dispatch_has_torch_function(args, nargs, nkwargs, 1))) {
+    return PyObject_Vectorcall(
+        self->cpp_redispatch_fn, args, static_cast<size_t>(nargs), kwnames);
+  }
   if (nargs == 0) {
     PyErr_SetString(PyExc_TypeError, "redispatch expected a DispatchKeySet");
     return nullptr;
