@@ -643,51 +643,6 @@ class TestCustomOp(CustomOpTestCaseBase):
         self.assertEqual(op(x), x + 1)
         self.assertEqual(calls, ["composite"])
 
-    def test_pyobject_dispatch_preserves_cpp_autograd_fallback(self):
-        lib = self.lib()
-        lib.define("pyobject_dispatch_cpu(Tensor x) -> Tensor")
-
-        calls = []
-
-        def cpu_impl(x):
-            calls.append("cpu")
-            return x + 1
-
-        lib.impl("pyobject_dispatch_cpu", cpu_impl, "CPU")
-
-        op = self.ns().pyobject_dispatch_cpu.default
-        op._enable_pyobj_dispatch(True)
-        self.assertTrue(op._is_pyobj_dispatcher_enabled())
-
-        x = torch.ones(2)
-        self.assertEqual(op(x), x + 1)
-        self.assertEqual(calls, ["cpu"])
-
-    def test_pyobject_dispatch_autograd_fallthrough(self):
-        lib = self.lib()
-        lib.define("pyobject_dispatch_autograd_fallthrough(Tensor x) -> Tensor")
-
-        calls = []
-
-        def cpu_impl(x):
-            calls.append("cpu")
-            return x + 1
-
-        lib.impl("pyobject_dispatch_autograd_fallthrough", cpu_impl, "CPU")
-        lib.impl(
-            "pyobject_dispatch_autograd_fallthrough",
-            torch.library.fallthrough_kernel,
-            "Autograd",
-        )
-
-        op = self.ns().pyobject_dispatch_autograd_fallthrough.default
-        op._enable_pyobj_dispatch(True)
-        self.assertTrue(op._is_pyobj_dispatcher_enabled())
-
-        x = torch.ones(2)
-        self.assertEqual(op(x), x + 1)
-        self.assertEqual(calls, ["cpu"])
-
     def test_pyobject_dispatch_custom_op_enabled_by_default(self):
         calls = []
 

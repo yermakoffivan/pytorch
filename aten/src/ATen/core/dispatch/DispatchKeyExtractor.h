@@ -195,6 +195,10 @@ struct TORCH_API DispatchKeyExtractor final {
     return getDispatchKeySetFromRawDispatchKeySet(ks);
   }
 
+  const c10::utils::bitset& dispatchArgIndicesReverse() const {
+    return dispatch_arg_indices_reverse_;
+  }
+
   void setOperatorHasFallthroughForKey(DispatchKey k, bool has_fallthrough);
 
   std::string dumpState() const;

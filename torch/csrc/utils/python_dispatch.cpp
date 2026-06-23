@@ -81,8 +81,6 @@ inline static torch::CppFunction dispatch_str(const char* key, Func&& raw_f) {
 
 class PythonKernelHolder : public c10::OperatorKernel {
   c10::SafePyObject func_;
-  c10::impl::PyInterpreter* interpreter_;
-  PyObject* raw_func_;
   c10::DispatchKey dispatch_key_;
   // If "with_keyset", then we expect a keyset as the first arg.
   bool with_keyset_;
@@ -96,15 +94,12 @@ class PythonKernelHolder : public c10::OperatorKernel {
       bool with_keyset = false,
       bool with_op = false)
       : func_(func.release().ptr(), getPyInterpreter()),
-        interpreter_(getPyInterpreter()),
-        raw_func_(func_.ptr(interpreter_)),
         dispatch_key_(dispatch_key),
         with_keyset_(with_keyset),
         with_op_(with_op) {}
 
   PyObject* func(c10::impl::PyInterpreter* interpreter) const {
-    TORCH_INTERNAL_ASSERT(interpreter == interpreter_);
-    return raw_func_;
+    return func_.ptr(interpreter);
   }
 
   bool with_keyset() const {
@@ -216,33 +211,26 @@ static py::object ophandle_call_boxed(
   return torch::jit::createPyObjectForStack(std::move(stack));
 }
 
-// PyObjectDispatchHandle is the C vectorcall object installed into
-// OpOverload._op. It owns the C++ dispatcher handles needed by the hot path;
-// the Python _PyObjectDispatcher dataclass only groups this handle with its
-// redispatch variant on OpOverload.
-struct PyObjectDispatchHandle {
+// Function that performs PyObject dispatch
+struct PyObjectDispatchFunc {
   PyObject_HEAD
-  // Calls the C++ Dispatcher's redispatch function and is used for when
-  // PyObject Dispatcher determines that the kernel for the current DispatchKey
-  // needs to be run in C++.
+  PyObject* cpp_dispatch_fn;
   PyObject* cpp_redispatch_fn;
-  // Handle to the C++ dispatcher operator entry. Used for schema access,
-  // dispatch table lookup, and owning the DispatchKeyExtractor below.
   c10::OperatorHandle* handle;
-  // Borrowed from handle. Computes the faithful dispatcher DispatchKeySet from
-  // the raw Tensor keyset plus TLS include/exclude state.
-  const c10::DispatchKeyExtractor* extractor;
-  // Python interpreter that owns Python kernels registered through this path.
   c10::impl::PyInterpreter* interpreter;
-  // CPython vectorcall entry point for either dispatch or redispatch.
   vectorcallfunc vectorcall;
 };
 
-static const PythonKernelHolder* get_python_kernel_holder(
-    const c10::KernelFunction& kernel) {
-  return kernel.boxedKernelFunctor<PythonKernelHolder>();
-}
+// Function that performs PyObject dispatch
+struct PyObjectRedispatchFunc {
+  PyObject_HEAD
+  PyObject* cpp_redispatch_fn;
+  c10::OperatorHandle* handle;
+  c10::impl::PyInterpreter* interpreter;
+  vectorcallfunc vectorcall;
+};
 
+// ORs the dispatch keys from `obj` into key_set
 static void pyobject_dispatch_collect_keys(
     PyObject* obj,
     uint64_t& key_set) {
@@ -264,191 +252,41 @@ static void pyobject_dispatch_collect_keys(
   }
 }
 
-static Py_ssize_t pyobject_dispatch_nkwargs(PyObject* kwnames) {
-  return kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames);
-}
-
-struct PyObjectDispatchArgs {
-  PyObject* const* args;
-  Py_ssize_t nargs;
-  PyObject* kwnames;
-  std::vector<PyObject*> storage;
-  PyObject* owned_kwnames = nullptr;
-  bool redispatch_to_cpp = false;
-
-  PyObjectDispatchArgs(
-      PyObject* const* args,
-      Py_ssize_t nargs,
-      PyObject* kwnames)
-      : args(args), nargs(nargs), kwnames(kwnames) {}
-  PyObjectDispatchArgs(const PyObjectDispatchArgs&) = delete;
-  PyObjectDispatchArgs& operator=(const PyObjectDispatchArgs&) = delete;
-  PyObjectDispatchArgs(PyObjectDispatchArgs&& other) noexcept
-      : args(other.args),
-        nargs(other.nargs),
-        kwnames(other.kwnames),
-        storage(std::move(other.storage)),
-        owned_kwnames(std::exchange(other.owned_kwnames, nullptr)),
-        redispatch_to_cpp(other.redispatch_to_cpp) {
-    if (!storage.empty()) {
-      args = storage.data();
-    }
-  }
-
-  ~PyObjectDispatchArgs() {
-    Py_XDECREF(owned_kwnames);
-  }
-};
-
-static Py_ssize_t pyobject_dispatch_find_schema_arg(
-    const c10::FunctionSchema& schema,
-    PyObject* name) {
-  auto* raw_name = PyUnicode_AsUTF8(name);
-  if (raw_name == nullptr) {
-    PyErr_Clear();
-    return -1;
-  }
-  const auto& schema_args = schema.arguments();
-  for (const auto i : c10::irange(schema_args.size())) {
-    if (schema_args[i].name() == raw_name) {
-      return static_cast<Py_ssize_t>(i);
-    }
-  }
-  return -1;
-}
-
-static Py_ssize_t pyobject_dispatch_kwarg_only_start(
-    const c10::FunctionSchema& schema) {
-  const auto& schema_args = schema.arguments();
-  for (const auto i : c10::irange(schema_args.size())) {
-    if (schema_args[i].kwarg_only()) {
-      return static_cast<Py_ssize_t>(i);
-    }
-  }
-  return static_cast<Py_ssize_t>(schema_args.size());
-}
-
-static PyObjectDispatchArgs pyobject_dispatch_normalize_args(
-    PyObjectDispatchHandle* self,
-    PyObject* const* args,
-    Py_ssize_t nargs,
-    PyObject* kwnames) {
-  PyObjectDispatchArgs normalized(args, nargs, kwnames);
-  Py_ssize_t nkwargs = pyobject_dispatch_nkwargs(kwnames);
-  if (nkwargs == 0) {
-    return normalized;
-  }
-
-  const auto& schema = self->handle->schema();
-  Py_ssize_t kwarg_only_start = pyobject_dispatch_kwarg_only_start(schema);
-  if (nargs > kwarg_only_start) {
-    normalized.redispatch_to_cpp = true;
-    return normalized;
-  }
-
-  std::vector<PyObject*> positional(schema.arguments().size(), nullptr);
-  std::vector<PyObject*> kwarg_names;
-  std::vector<PyObject*> kwarg_values;
-  Py_ssize_t normalized_nargs = nargs;
-  for (Py_ssize_t i = 0; i < nkwargs; ++i) {
-    PyObject* name = PyTuple_GET_ITEM(kwnames, i);
-    PyObject* value = args[nargs + i];
-    Py_ssize_t arg_idx = pyobject_dispatch_find_schema_arg(schema, name);
-    if (arg_idx < 0) {
-      normalized.redispatch_to_cpp = true;
-      return normalized;
-    }
-    if (arg_idx < kwarg_only_start) {
-      if (arg_idx < nargs || positional[arg_idx] != nullptr) {
-        normalized.redispatch_to_cpp = true;
-        return normalized;
-      }
-      positional[arg_idx] = value;
-      if (arg_idx + 1 > normalized_nargs) {
-        normalized_nargs = arg_idx + 1;
-      }
-    } else {
-      kwarg_names.push_back(name);
-      kwarg_values.push_back(value);
-    }
-  }
-
-  for (Py_ssize_t i = nargs; i < normalized_nargs; ++i) {
-    if (positional[i] == nullptr) {
-      normalized.redispatch_to_cpp = true;
-      return normalized;
-    }
-  }
-  if (normalized_nargs == nargs &&
-      static_cast<Py_ssize_t>(kwarg_values.size()) == nkwargs) {
-    return normalized;
-  }
-
-  normalized.storage.reserve(normalized_nargs + kwarg_values.size());
-  for (Py_ssize_t i = 0; i < nargs; ++i) {
-    normalized.storage.push_back(args[i]);
-  }
-  for (Py_ssize_t i = nargs; i < normalized_nargs; ++i) {
-    normalized.storage.push_back(positional[i]);
-  }
-  for (PyObject* value : kwarg_values) {
-    normalized.storage.push_back(value);
-  }
-
-  if (kwarg_names.empty()) {
-    normalized.kwnames = nullptr;
-  } else {
-    normalized.owned_kwnames = PyTuple_New(kwarg_names.size());
-    if (normalized.owned_kwnames == nullptr) {
-      throw python_error();
-    }
-    for (const auto i : c10::irange(kwarg_names.size())) {
-      Py_INCREF(kwarg_names[i]);
-      PyTuple_SET_ITEM(normalized.owned_kwnames, i, kwarg_names[i]);
-    }
-    normalized.kwnames = normalized.owned_kwnames;
-  }
-
-  normalized.args = normalized.storage.data();
-  normalized.nargs = normalized_nargs;
-  return normalized;
-}
-
 static c10::DispatchKeySet pyobject_dispatch_compute_keyset(
     const c10::DispatchKeyExtractor& extractor,
     PyObject* const* args,
-    Py_ssize_t nargs,
-    PyObject* kwnames,
-    Py_ssize_t first_arg) {
+    Py_ssize_t nargs) {
   uint64_t key_set = 0;
-  Py_ssize_t nkwargs = pyobject_dispatch_nkwargs(kwnames);
-  for (Py_ssize_t i = first_arg; i < nargs + nkwargs; ++i) {
-    pyobject_dispatch_collect_keys(args[i], key_set);
-  }
+  extractor.dispatchArgIndicesReverse().for_each_set_bit(
+      [&](size_t reverse_arg_index) {
+        pyobject_dispatch_collect_keys(
+            args[nargs - 1 - static_cast<Py_ssize_t>(reverse_arg_index)],
+            key_set);
+      });
   return extractor.getDispatchKeySetFromRawDispatchKeySet(
       c10::DispatchKeySet::from_raw_repr(key_set));
 }
 
 static PyObject* pyobject_dispatch_call_redispatch_cpp(
-    PyObjectDispatchHandle* self,
+    PyObject* cpp_redispatch_fn,
     c10::DispatchKeySet key_set,
     PyObject* const* args,
     Py_ssize_t nargs,
     Py_ssize_t nkwargs,
     PyObject* kwnames,
-    Py_ssize_t first_arg) {
+    Py_ssize_t op_args_start) {
   HANDLE_TH_ERRORS
   py::object py_key_set = py::cast(key_set);
   std::vector<PyObject*> call_args;
-  call_args.reserve(1 + nargs - first_arg + nkwargs);
+  call_args.reserve(1 + nargs - op_args_start + nkwargs);
   call_args.push_back(py_key_set.ptr());
-  for (Py_ssize_t i = first_arg; i < nargs + nkwargs; ++i) {
+  for (Py_ssize_t i = op_args_start; i < nargs + nkwargs; ++i) {
     call_args.push_back(args[i]);
   }
   return PyObject_Vectorcall(
-      self->cpp_redispatch_fn,
+      cpp_redispatch_fn,
       call_args.data(),
-      static_cast<size_t>(1 + nargs - first_arg),
+      static_cast<size_t>(1 + nargs - op_args_start),
       kwnames);
   END_HANDLE_TH_ERRORS
 }
@@ -458,11 +296,11 @@ static PyObject* pyobject_dispatch_call_python(
     PyObject* const* args,
     Py_ssize_t nargs,
     PyObject* kwnames,
-    Py_ssize_t first_arg) {
+    Py_ssize_t op_args_start) {
   return PyObject_Vectorcall(
       kernel,
-      args + first_arg,
-      static_cast<size_t>(nargs - first_arg),
+      args + op_args_start,
+      static_cast<size_t>(nargs - op_args_start),
       kwnames);
 }
 
@@ -473,56 +311,63 @@ static PyObject* pyobject_dispatch_call_python_with_keyset(
     Py_ssize_t nargs,
     Py_ssize_t nkwargs,
     PyObject* kwnames,
-    Py_ssize_t first_arg) {
+    Py_ssize_t op_args_start) {
   HANDLE_TH_ERRORS
   py::object py_key_set = py::cast(key_set);
   std::vector<PyObject*> call_args;
-  call_args.reserve(1 + nargs - first_arg + nkwargs);
+  call_args.reserve(1 + nargs - op_args_start + nkwargs);
   call_args.push_back(py_key_set.ptr());
-  for (Py_ssize_t i = first_arg; i < nargs + nkwargs; ++i) {
+  for (Py_ssize_t i = op_args_start; i < nargs + nkwargs; ++i) {
     call_args.push_back(args[i]);
   }
   return PyObject_Vectorcall(
       kernel,
       call_args.data(),
-      static_cast<size_t>(1 + nargs - first_arg),
+      static_cast<size_t>(1 + nargs - op_args_start),
       kwnames);
   END_HANDLE_TH_ERRORS
 }
 
+template <typename Func>
 static PyObject* pyobject_dispatch_with_keyset(
-    PyObjectDispatchHandle* self,
+    Func* self,
     c10::DispatchKeySet key_set,
     PyObject* const* args,
     Py_ssize_t nargs,
     PyObject* kwnames,
-    Py_ssize_t first_arg) {
+    Py_ssize_t op_args_start) {
+  Py_ssize_t nkwargs = kwnames == nullptr ? 0 : PyTuple_GET_SIZE(kwnames);
+  // TODO: there's something weird about these keys, we'll handle them in a
+  // follow-up. For now, just send them back to C++ dispatcher.
   if (C10_UNLIKELY(key_set.has(c10::DispatchKey::Python)) ||
       C10_UNLIKELY(
           key_set.highestPriorityTypeId() == c10::DispatchKey::BackendSelect) ||
       c10::impl::TorchDispatchModeTLS::stack_len() > 0) {
     return pyobject_dispatch_call_redispatch_cpp(
-        self,
+        self->cpp_redispatch_fn,
         key_set,
         args,
         nargs,
-        pyobject_dispatch_nkwargs(kwnames),
+        nkwargs,
         kwnames,
-        first_arg);
+        op_args_start);
   }
   HANDLE_TH_ERRORS
   const auto& kernel_function = self->handle->lookup(key_set);
-  const auto* holder = get_python_kernel_holder(kernel_function);
+  // If there's no Python kernel, call back to the C++ Dispatcher
+  const auto* holder =
+      kernel_function.template boxedKernelFunctor<PythonKernelHolder>();
   if (C10_UNLIKELY(holder == nullptr || holder->with_op())) {
     return pyobject_dispatch_call_redispatch_cpp(
-        self,
+        self->cpp_redispatch_fn,
         key_set,
         args,
         nargs,
-        pyobject_dispatch_nkwargs(kwnames),
+        nkwargs,
         kwnames,
-        first_arg);
+        op_args_start);
   }
+  // Otherwise, just directly invoke the Python kernel.
   auto* kernel = holder->func(self->interpreter);
   TORCH_INTERNAL_ASSERT(kernel != nullptr);
   if (C10_UNLIKELY(holder->with_keyset())) {
@@ -531,12 +376,12 @@ static PyObject* pyobject_dispatch_with_keyset(
         key_set,
         args,
         nargs,
-        pyobject_dispatch_nkwargs(kwnames),
+        nkwargs,
         kwnames,
-        first_arg);
+        op_args_start);
   }
   return pyobject_dispatch_call_python(
-      kernel, args, nargs, kwnames, first_arg);
+      kernel, args, nargs, kwnames, op_args_start);
   END_HANDLE_TH_ERRORS
 }
 
@@ -545,33 +390,23 @@ static PyObject* pyobject_dispatch_vectorcall(
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
-  auto* self = reinterpret_cast<PyObjectDispatchHandle*>(callable);
+  auto* self = reinterpret_cast<PyObjectDispatchFunc*>(callable);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  auto normalized =
-      pyobject_dispatch_normalize_args(self, args, nargs, kwnames);
-  auto key_set = pyobject_dispatch_compute_keyset(
-      *self->extractor,
-      normalized.args,
-      normalized.nargs,
-      normalized.kwnames,
-      0);
-  if (C10_UNLIKELY(normalized.redispatch_to_cpp)) {
-    return pyobject_dispatch_call_redispatch_cpp(
-        self,
-        key_set,
-        args,
-        nargs,
-        pyobject_dispatch_nkwargs(kwnames),
-        kwnames,
-        0);
+  if (C10_UNLIKELY(
+          (kwnames != nullptr && PyTuple_GET_SIZE(kwnames) != 0) ||
+          static_cast<size_t>(nargs) != self->handle->schema().arguments().size())) {
+    // TODO(rzou): We need to normalize the (args, kwargs) into the C++
+    // Dispatcher convention because that's what all Python kernels expect.
+    // (that is, all kw-only-args get passed as kwargs, and everything else
+    // gets passed as positional). For now, just fall back to the C++ Dispatcher
+    // if we get any kwargs.
+    return PyObject_Vectorcall(
+        self->cpp_dispatch_fn, args, static_cast<size_t>(nargs), kwnames);
   }
+  auto key_set = pyobject_dispatch_compute_keyset(
+      self->handle->dispatchKeyExtractor(), args, nargs);
   return pyobject_dispatch_with_keyset(
-      self,
-      key_set,
-      normalized.args,
-      normalized.nargs,
-      normalized.kwnames,
-      0);
+      self, key_set, args, nargs, kwnames, 0);
 }
 
 static PyObject* pyobject_redispatch_vectorcall(
@@ -579,7 +414,7 @@ static PyObject* pyobject_redispatch_vectorcall(
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
-  auto* self = reinterpret_cast<PyObjectDispatchHandle*>(callable);
+  auto* self = reinterpret_cast<PyObjectRedispatchFunc*>(callable);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
   if (nargs == 0) {
     PyErr_SetString(PyExc_TypeError, "redispatch expected a DispatchKeySet");
@@ -600,47 +435,84 @@ static PyObject* pyobject_redispatch_vectorcall(
       self, key_set, args, nargs, kwnames, 1);
 }
 
-static void pyobject_dispatch_dealloc(PyObjectDispatchHandle* self) {
+static void pyobject_dispatch_dealloc(PyObjectDispatchFunc* self) {
+  Py_XDECREF(self->cpp_dispatch_fn);
   Py_XDECREF(self->cpp_redispatch_fn);
   delete self->handle;
   Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
 }
 
-static PyTypeObject PyObjectDispatchHandleType = {
+static void pyobject_redispatch_dealloc(PyObjectRedispatchFunc* self) {
+  Py_XDECREF(self->cpp_redispatch_fn);
+  delete self->handle;
+  Py_TYPE(self)->tp_free(reinterpret_cast<PyObject*>(self));
+}
+
+static PyTypeObject PyObjectDispatchFuncType = {
     PyVarObject_HEAD_INIT(nullptr, 0)};
 
-static PyObject* make_pyobject_dispatch_handle(
-    const c10::OperatorHandle& py_handle,
+static PyTypeObject PyObjectRedispatchFuncType = {
+    PyVarObject_HEAD_INIT(nullptr, 0)};
+
+static PyObject* make_pyobject_dispatch_func(
+    const c10::OperatorHandle& handle,
+    PyObject* cpp_dispatch_fn,
     PyObject* cpp_redispatch_fn,
     vectorcallfunc vectorcall) {
-  auto* handle = new c10::OperatorHandle(py_handle);
-  auto* result =
-      PyObject_New(PyObjectDispatchHandle, &PyObjectDispatchHandleType);
+  auto* owned_handle = new c10::OperatorHandle(handle);
+  auto* result = PyObject_New(PyObjectDispatchFunc, &PyObjectDispatchFuncType);
   if (result == nullptr) {
-    delete handle;
+    delete owned_handle;
     throw python_error();
   }
+  Py_INCREF(cpp_dispatch_fn);
   Py_INCREF(cpp_redispatch_fn);
+  result->cpp_dispatch_fn = cpp_dispatch_fn;
   result->cpp_redispatch_fn = cpp_redispatch_fn;
-  result->handle = handle;
-  result->extractor = &handle->dispatchKeyExtractor();
+  result->handle = owned_handle;
   result->interpreter = getPyInterpreter();
   result->vectorcall = vectorcall;
   return reinterpret_cast<PyObject*>(result);
 }
 
-static py::tuple make_pyobject_dispatchers(
+static PyObject* make_pyobject_redispatch_func(
+    const c10::OperatorHandle& handle,
+    PyObject* cpp_redispatch_fn,
+    vectorcallfunc vectorcall) {
+  auto* owned_handle = new c10::OperatorHandle(handle);
+  auto* result =
+      PyObject_New(PyObjectRedispatchFunc, &PyObjectRedispatchFuncType);
+  if (result == nullptr) {
+    delete owned_handle;
+    throw python_error();
+  }
+  Py_INCREF(cpp_redispatch_fn);
+  result->cpp_redispatch_fn = cpp_redispatch_fn;
+  result->handle = owned_handle;
+  result->interpreter = getPyInterpreter();
+  result->vectorcall = vectorcall;
+  return reinterpret_cast<PyObject*>(result);
+}
+
+static py::tuple make_pyobj_dispatch_fns(
     const py::object& py_handle,
+    const py::object& cpp_dispatch_fn,
     const py::object& cpp_redispatch_fn) {
+  TORCH_CHECK(
+      PyCallable_Check(cpp_dispatch_fn.ptr()),
+      "cpp_dispatch_fn must be callable");
   TORCH_CHECK(
       PyCallable_Check(cpp_redispatch_fn.ptr()),
       "cpp_redispatch_fn must be callable");
   const auto& handle = py_handle.cast<c10::OperatorHandle&>();
   auto dispatch = py::reinterpret_steal<py::object>(
-      make_pyobject_dispatch_handle(
-          handle, cpp_redispatch_fn.ptr(), pyobject_dispatch_vectorcall));
+      make_pyobject_dispatch_func(
+          handle,
+          cpp_dispatch_fn.ptr(),
+          cpp_redispatch_fn.ptr(),
+          pyobject_dispatch_vectorcall));
   auto redispatch = py::reinterpret_steal<py::object>(
-      make_pyobject_dispatch_handle(
+      make_pyobject_redispatch_func(
           handle, cpp_redispatch_fn.ptr(), pyobject_redispatch_vectorcall));
   return py::make_tuple(std::move(dispatch), std::move(redispatch));
 }
@@ -670,16 +542,29 @@ class SetExcludeDispatchKeyGuard {
 void initDispatchBindings(PyObject* module) {
   auto m = py::handle(module).cast<py::module>();
 
-  PyObjectDispatchHandleType.tp_name = "torch._C._PyObjectDispatchHandle";
-  PyObjectDispatchHandleType.tp_basicsize = sizeof(PyObjectDispatchHandle);
-  PyObjectDispatchHandleType.tp_dealloc =
+  PyObjectDispatchFuncType.tp_name = "torch._C._PyObjectDispatchFunc";
+  PyObjectDispatchFuncType.tp_basicsize = sizeof(PyObjectDispatchFunc);
+  PyObjectDispatchFuncType.tp_dealloc =
       reinterpret_cast<destructor>(pyobject_dispatch_dealloc);
-  PyObjectDispatchHandleType.tp_flags =
+  PyObjectDispatchFuncType.tp_flags =
       Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_VECTORCALL;
-  PyObjectDispatchHandleType.tp_call = PyVectorcall_Call;
-  PyObjectDispatchHandleType.tp_vectorcall_offset =
-      offsetof(PyObjectDispatchHandle, vectorcall);
-  if (PyType_Ready(&PyObjectDispatchHandleType) < 0) {
+  PyObjectDispatchFuncType.tp_call = PyVectorcall_Call;
+  PyObjectDispatchFuncType.tp_vectorcall_offset =
+      offsetof(PyObjectDispatchFunc, vectorcall);
+  if (PyType_Ready(&PyObjectDispatchFuncType) < 0) {
+    throw python_error();
+  }
+
+  PyObjectRedispatchFuncType.tp_name = "torch._C._PyObjectRedispatchFunc";
+  PyObjectRedispatchFuncType.tp_basicsize = sizeof(PyObjectRedispatchFunc);
+  PyObjectRedispatchFuncType.tp_dealloc =
+      reinterpret_cast<destructor>(pyobject_redispatch_dealloc);
+  PyObjectRedispatchFuncType.tp_flags =
+      Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_VECTORCALL;
+  PyObjectRedispatchFuncType.tp_call = PyVectorcall_Call;
+  PyObjectRedispatchFuncType.tp_vectorcall_offset =
+      offsetof(PyObjectRedispatchFunc, vectorcall);
+  if (PyType_Ready(&PyObjectRedispatchFuncType) < 0) {
     throw python_error();
   }
 
@@ -706,7 +591,7 @@ void initDispatchBindings(PyObject* module) {
           });
 
   m.def("_dispatch_call_boxed", &ophandle_call_boxed);
-  m.def("_dispatch_make_pyobject_dispatchers", &make_pyobject_dispatchers);
+  m.def("_dispatch_make_pyobj_dispatch_fns", &make_pyobj_dispatch_fns);
 
   // TODO: figure out how to do chaining
   py::class_<torch::Library>(m, "_DispatchModule")

@@ -971,8 +971,9 @@ class OpOverload(OperatorBase, Generic[_P, _T]):
             self._pyobj_dispatcher = None
             self._op = self._cpp_dispatch_handle
             return
-        dispatch, redispatch = torch._C._dispatch_make_pyobject_dispatchers(
+        dispatch, redispatch = torch._C._dispatch_make_pyobj_dispatch_fns(
             self._handle,
+            self._cpp_dispatch_handle,
             self._handle.redispatch_boxed,
         )
         self._pyobj_dispatcher = _PyObjectDispatcher(dispatch, redispatch)
