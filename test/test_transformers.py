@@ -1586,6 +1586,30 @@ class TestSDPAFailureModes(NNTestCase):
     _do_cuda_memory_leak_check = True
     _do_cuda_non_default_stream = True
 
+    @parametrize(
+        "backend",
+        [
+            None,
+            SDPBackend.ERROR,
+            SDPBackend.MATH,
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+            SDPBackend.CUDNN_ATTENTION,
+            SDPBackend.OVERRIDEABLE,
+        ],
+        name_fn=lambda backend: "default" if backend is None else backend.name.lower(),
+    )
+    def test_attn_mask_and_is_causal_errors_before_dispatch(self, device, backend):
+        q = torch.randn(2, 4, 8, 16, device=device)
+        k = torch.randn(2, 4, 8, 16, device=device)
+        v = torch.randn(2, 4, 8, 16, device=device)
+        attn_mask = torch.zeros(8, 8, device=device)
+
+        context = contextlib.nullcontext() if backend is None else sdpa_kernel(backends=[backend])
+        with context:
+            with self.assertRaisesRegex(RuntimeError, "Explicit attn_mask should not be set when is_causal=True"):
+                F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=True)
+
     @onlyCUDA
     @unittest.skipIf(
         not PLATFORM_SUPPORTS_FLASH_ATTENTION or not isSM8XDevice or not isSM120Device,
