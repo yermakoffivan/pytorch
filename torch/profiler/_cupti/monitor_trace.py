@@ -1118,6 +1118,67 @@ def _build_gpu_counters(env: dict | None, active_devices: set):
     )
 
 
+def _build_pm_counters(pm: dict | None, active_devices: set):
+    """Build the GpuCounterEvent payload from PM-sampling columns (start_ns/device_id plus one
+    ``c<counter_id>`` value column per metric, see pm_sampling.PM_METRICS): same tuple shape as
+    :func:`_build_gpu_counters`. Restricted to devices that ran GPU work."""
+    from torch.profiler._cupti.pm_sampling import PM_METRICS
+
+    if not pm or not len(pm.get("start_ns", ())):
+        return None
+    ts = np.ascontiguousarray(pm["start_ns"], dtype=np.int64)
+    dev = np.asarray(pm["device_id"], dtype=np.int64)
+    base = (
+        np.isin(dev, list(active_devices))
+        if active_devices
+        else np.ones(len(dev), dtype=bool)
+    )
+    if not base.any():
+        return None
+    specs, gpu_l, ts_l, cid_l, val_l = [], [], [], [], []
+    for cid, name, _ in PM_METRICS:
+        col = pm.get(f"c{cid}")
+        if col is None:
+            continue
+        specs.append((cid, name))
+        gpu_l.append(dev[base])
+        ts_l.append(ts[base])
+        cid_l.append(np.full(int(base.sum()), cid, dtype=np.int32))
+        val_l.append(np.asarray(col, dtype=np.float64)[base])
+    if not specs:
+        return None
+    return (
+        specs,
+        np.concatenate(gpu_l).astype(np.int32),
+        np.concatenate(ts_l).astype(np.int64),
+        np.concatenate(cid_l).astype(np.int32),
+        np.concatenate(val_l).astype(np.float64),
+    )
+
+
+def _merge_counters(*parts):
+    """Concatenate GpuCounterEvent payloads (the tuples from the per-source builders) into a
+    single payload for the encoder; the counter_id namespaces are disjoint across sources."""
+    parts = [p for p in parts if p]
+    if not parts:
+        return None
+    specs: list = []
+    gpu_l, ts_l, cid_l, val_l = [], [], [], []
+    for s, g, t, c, v in parts:
+        specs.extend(s)
+        gpu_l.append(g)
+        ts_l.append(t)
+        cid_l.append(c)
+        val_l.append(v)
+    return (
+        specs,
+        np.concatenate(gpu_l),
+        np.concatenate(ts_l),
+        np.concatenate(cid_l),
+        np.concatenate(val_l),
+    )
+
+
 def _window_to_pftrace(
     cpu_data: dict, trace_window: dict, base_ns: int, output_path: str
 ) -> None:
@@ -1557,7 +1618,10 @@ def _window_to_pftrace(
             active_devices.update(np.unique(c["device_id"]).tolist())
     # GPU counters (power/temp/clocks) -> GpuCounterEvents: the viewer renders them under
     # "GPU / Counters / <gpu>", a sibling of the render-stage hardware queues, keyed by gpu_id.
-    counters = _build_gpu_counters(columns.get("environment"), active_devices)
+    counters = _merge_counters(
+        _build_gpu_counters(columns.get("environment"), active_devices),
+        _build_pm_counters(columns.get("pm_sampling"), active_devices),
+    )
     # encode_pftrace returns gzip-compressed bytes (compressed in C++), so write as-is.
     out = torch._C._profiler._cupti_monitor.encode_pftrace(
         tracks, name_table, group_tuples, render, counters
