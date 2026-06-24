@@ -18223,8 +18223,6 @@ op_db: list[OpInfo] = [
         supports_cow_input_no_materialize_forward=False,
         decorators=[onlyCPU],
         skips=(
-            # Bug: noncontiguous inputs produce NaN outputs - implementation doesn't handle strides correctly
-            DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_noncontiguous_samples', device_type='cpu'),
         )
     ),
     OpInfo(
