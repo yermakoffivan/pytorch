@@ -3747,6 +3747,23 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 )
             )
 
+        if not self._object_has_getattribute:
+            type_attr = self.lookup_class_mro_attr(name)
+            if (
+                (type_attr is NO_SUCH_SUBOBJ or not is_data_descriptor(type_attr))
+                and hasattr(self.value, "__dict__")
+                and not tx.output.side_effects.has_pending_mutation_of_attr(
+                    self,
+                    name,
+                    (AttrMutationKind.INSTANCE_DICT, AttrMutationKind.GENERIC_SETATTR),
+                )
+                and not tx.output.side_effects.has_pending_mutation_of_attr(
+                    self, "__dict__", AttrMutationKind.GENERIC_SETATTR
+                )
+                and self.has_key_in_generic_dict(tx, name)
+            ):
+                return variables.ConstantVariable.create(True)
+
         try:
             var_vt = self.var_getattr(tx, name)
             return VariableTracker.build(
@@ -5178,6 +5195,16 @@ class UserDefinedDequeVariable(UserDefinedObjectVariable):
         self._base_methods = deque_methods
         if self._base_vt is None:
             raise AssertionError("_base_vt must not be None after initialization")
+
+    def var_getattr(
+        self, tx: "InstructionTranslatorBase", name: str
+    ) -> VariableTracker:
+        # maxlen is a read-only getset on deque, not a method, so it is not
+        # covered by the _base_methods call_method delegation; route it to the
+        # DequeVariable which tracks maxlen on the base deque.
+        if name == "maxlen" and self._base_vt is not None:
+            return self._base_vt.var_getattr(tx, name)
+        return super().var_getattr(tx, name)
 
 
 class UserDefinedTupleVariable(UserDefinedObjectVariable):
