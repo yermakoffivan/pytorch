@@ -2855,7 +2855,7 @@ class CUDAGraphTreeManager:
             "or call torch.compiler.cudagraph_mark_step_begin() before each model invocation. "
             "If the tensor is a user-visible output that must remain live across "
             "generations, set torch._inductor.config.triton."
-            "cudagraph_trees_generation_cloning = 'user_visible_outputs'."
+            "cudagraph_trees_generation_cloning = 'user_visible'."
         )
 
     def dealloc_current_path_weakrefs(self) -> None:

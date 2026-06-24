@@ -64,6 +64,7 @@ from torch._functorch.aot_autograd import (
 from torch._inductor.codecache import code_hash, FxGraphCache, output_code_log
 from torch._inductor.cudagraph_utils import (
     BoxedDeviceIndex,
+    cudagraph_trees_clone_live_user_visible_outputs,
     cudagraphs_log,
     format_default_skip_message,
     log_cudagraph_skip_and_bump_counter,
@@ -306,7 +307,7 @@ def _recursive_record_user_visible_output_idxs(gm: GraphModule) -> None:
 
 
 def _cudagraph_trees_clone_live_user_outputs() -> bool:
-    return config.triton.cudagraph_trees_generation_cloning == "user_visible_outputs"
+    return cudagraph_trees_clone_live_user_visible_outputs()
 
 
 @functools.lru_cache(None)

@@ -4,7 +4,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable
 from enum import Enum
-from typing import Any, TYPE_CHECKING, TypeVar
+from typing import Any, Literal, TYPE_CHECKING, TypeVar
 
 import torch
 from torch._dynamo.utils import counters, get_metrics_context
@@ -12,6 +12,7 @@ from torch._inductor.utils import GraphPartitionMap, InputType
 from torch._subclasses.fake_tensor import get_plain_tensors, is_fake
 from torch.utils._ordered_set import OrderedSet
 
+from . import config
 from .utils import is_using_cudagraph_partition
 
 
@@ -31,6 +32,20 @@ static_inputs_log = torch._logging.getArtifactLogger(
 
 OutputType = list[int | torch.Tensor | None]
 ModelType = Callable[[list[InputType]], OutputType]
+
+
+def cudagraph_trees_generation_cloning() -> Literal["user_visible"] | None:
+    mode = config.triton.cudagraph_trees_generation_cloning
+    assert mode in (None, "user_visible"), (
+        "Expected torch._inductor.config.triton."
+        "cudagraph_trees_generation_cloning to be None or 'user_visible', "
+        f"got {mode!r}"
+    )
+    return mode
+
+
+def cudagraph_trees_clone_live_user_visible_outputs() -> bool:
+    return cudagraph_trees_generation_cloning() == "user_visible"
 
 
 INPUT_STORAGE_MUTATION_TARGETS = (

@@ -35,6 +35,7 @@ from torch._guards import compile_context, CompileContext
 from torch._higher_order_ops.wrap import inductor_compiled_code
 from torch._inductor.cudagraph_utils import (
     BoxedDeviceIndex,
+    cudagraph_trees_clone_live_user_visible_outputs,
     CudagraphCachedInfo,
     CudagraphMetadata,
     get_input_storage_mutation_info,
@@ -677,8 +678,7 @@ class CompiledFxGraph(OutputCode):
                 ]
                 user_visible_output_idxs = (
                     output.meta.get("user_visible_output_idxs", ())
-                    if config.triton.cudagraph_trees_generation_cloning
-                    == "user_visible_outputs"
+                    if cudagraph_trees_clone_live_user_visible_outputs()
                     else ()
                 )
                 cudagraph_fail_reasons = [s for b, s in cudagraph_tests if not b]
