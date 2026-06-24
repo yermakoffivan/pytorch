@@ -1140,7 +1140,7 @@ def get_cpp_options(
 
     passthrough_args.append(" ".join(extra_flags))
 
-    if config.aot_inductor.cross_target_platform == "windows":
+    if config.aot_inductor.cross_target_platform == "windows" and do_link:
         passthrough_args.extend(["-static-libstdc++", "-static-libgcc"])
         if check_mingw_win32_flavor(MINGW_GXX) == "posix":
             # winpthread provides clock_gettime, referenced by static libstdc++'s
