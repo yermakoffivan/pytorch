@@ -125,7 +125,7 @@ def allow_in_graph(fn):
     - all Tensors used inside of ``fn`` must be passed directly as inputs to ``fn``
       (as opposed to being captured variables).
 
-    See also :func:`nonstrict_trace()`, which has slightly fewer restrictions on the inputs
+    See also :func:`nonstrict_trace()`, which has slightly fewer restrictions on the inputs.
 
     Args:
         fn: A callable representing the function to be included in the graph.
@@ -178,7 +178,7 @@ def nonstrict_trace(traceable_fn: Callable[_P, _R]) -> Callable[_P, _R]:
           will flow through the nonstrict-traced function.
 
     Dangerous patterns (may cause silent incorrectness):
-        - Side effects between nonstric_traced fn and compiled region: The function should
+        - Side effects between nonstric_trace'd fn and compiled region: The function should
           not depend on variables mutated by other code inside the compiled function, and code
           after the call should not depend on mutations made by it.
 
