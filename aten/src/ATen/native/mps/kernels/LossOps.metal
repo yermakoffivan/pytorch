@@ -6,14 +6,14 @@ using namespace metal;
 using namespace c10::metal;
 
 // Augmented target lookup: l'[idx] is BLANK for even idx, l[idx/2] for odd.
-template <typename T_target>
-inline int32_t get_target_prime(
+template <typename T_target, typename T_index>
+inline T_index get_target_prime(
     constant T_target* targets,
-    uint32_t stride,
-    uint32_t idx,
-    int32_t BLANK) {
+    T_index stride,
+    T_index idx,
+    T_index BLANK) {
   return (idx % 2 == 0) ? BLANK
-                        : static_cast<int32_t>(targets[stride * (idx / 2)]);
+                        : static_cast<T_index>(targets[stride * (idx / 2)]);
 }
 
 // Calculate `logsumexp(A, ...) = m + logsumexp(A - m, ...)`,
@@ -41,16 +41,16 @@ static inline T logsumexp(T first, Ts... rest) {
   return precise::log(s) + m;
 }
 
-template <typename T, typename T_target>
+template <typename T, typename T_target, typename T_index>
 kernel void ctc_loss(
     device T* loss [[buffer(0)]],
     device T* log_alpha [[buffer(1)]],
     constant T* log_probs [[buffer(2)]],
     constant T_target* targets [[buffer(3)]],
-    constant int32_t* input_lengths [[buffer(4)]],
-    constant int32_t* target_lengths [[buffer(5)]],
-    constant int32_t* target_batch_offsets [[buffer(6)]],
-    constant CTCLossParams& params [[buffer(7)]],
+    constant T_index* input_lengths [[buffer(4)]],
+    constant T_index* target_lengths [[buffer(5)]],
+    constant T_index* target_batch_offsets [[buffer(6)]],
+    constant CTCLossParams<T_index>& params [[buffer(7)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tptg [[threads_per_threadgroup]]) {
@@ -58,29 +58,30 @@ kernel void ctc_loss(
   constexpr T neginf = -numeric_limits<T>::infinity();
   constexpr T_op neginf_op = -numeric_limits<T_op>::infinity();
 
-  uint32_t input_length = input_lengths[tgid];
-  uint32_t target_length = target_lengths[tgid];
+  auto batch = static_cast<T_index>(tgid);
+  T_index input_length = input_lengths[batch];
+  T_index target_length = target_lengths[batch];
 
   if (input_length == 0) {
     if (tid == 0)
-      loss[tgid] = (target_length == 0) ? T(0) : T(INFINITY);
+      loss[batch] = (target_length == 0) ? T(0) : T(INFINITY);
     return;
   }
 
-  targets += target_batch_offsets[tgid];
-  log_alpha += tgid * params.log_alpha_batch_stride;
-  log_probs += tgid * params.log_probs_batch_stride;
+  targets += target_batch_offsets[batch];
+  log_alpha += batch * params.log_alpha_batch_stride;
+  log_probs += batch * params.log_probs_batch_stride;
 
-  uint32_t S_max = 2 * params.max_target_length + 1;
-  uint32_t S = 2 * target_length + 1;
+  T_index S_max = 2 * params.max_target_length + 1;
+  T_index S = 2 * target_length + 1;
 
   // Initialize first time step for all the target tokens assigned to this
   // thread.
-  for (uint32_t s = tid; s < S_max; s += tptg) {
+  for (T_index s = tid; s < S_max; s += tptg) {
     T la;
     switch (s) {
       case 0:
-        la = log_probs[0];
+        la = log_probs[params.log_probs_token_stride * params.BLANK];
         break;
       case 1:
         la = (target_length == 0)
@@ -97,8 +98,9 @@ kernel void ctc_loss(
 
   // Iterate over the rest of the time steps, for each of the target tokens
   // assigned to this thread.
-  for (uint32_t s = tid; s < S_max; s += tptg) {
-    int32_t target_token;
+  for (T_index block_s = 0; block_s < S_max; block_s += tptg) {
+    T_index s = block_s + tid;
+    T_index target_token;
     bool use_C;
 
     if (s < S && target_length > 0) {
@@ -113,7 +115,7 @@ kernel void ctc_loss(
       use_C = false;
     }
 
-    for (uint32_t t = 1; t < params.max_input_length; t++) {
+    for (T_index t = 1; t < params.max_input_length; t++) {
       threadgroup_barrier(mem_flags::mem_device);
       if (t < input_length && s < S) {
         // A = log(alpha[t-1, s])
@@ -162,28 +164,32 @@ kernel void ctc_loss(
                   [params.log_alpha_time_stride * (input_length - 1) +
                    params.log_alpha_target_stride * (target_length * 2 - 1)])
         : neginf_op;
-    loss[tgid] = static_cast<T>(-logsumexp(l1, l2));
+    loss[batch] = static_cast<T>(-logsumexp(l1, l2));
   }
 }
 
-#define INSTANTIATE_CTC_LOSS(T, T_target)              \
-  template [[host_name("ctc_loss_" #T "_" #T_target)]] \
-  kernel void ctc_loss<T, T_target>(                   \
-      device T*,                                       \
-      device T*,                                       \
-      constant T*,                                     \
-      constant T_target*,                              \
-      constant int32_t*,                               \
-      constant int32_t*,                               \
-      constant int32_t*,                               \
-      constant CTCLossParams&,                         \
-      uint,                                            \
-      uint,                                            \
+#define INSTANTIATE_CTC_LOSS(T, T_target, T_index)                  \
+  template [[host_name("ctc_loss_" #T "_" #T_target "_" #T_index)]] \
+  kernel void ctc_loss<T, T_target, T_index>(                       \
+      device T*,                                                    \
+      device T*,                                                    \
+      constant T*,                                                  \
+      constant T_target*,                                           \
+      constant T_index*,                                            \
+      constant T_index*,                                            \
+      constant T_index*,                                            \
+      constant CTCLossParams<T_index>&,                             \
+      uint,                                                         \
+      uint,                                                         \
       uint);
 
+#define INSTANTIATE_CTC_LOSS_INDEX_TYPES(T, T_target) \
+  INSTANTIATE_CTC_LOSS(T, T_target, int32_t);         \
+  INSTANTIATE_CTC_LOSS(T, T_target, int64_t);
+
 #define INSTANTIATE_CTC_LOSS_TARGET_TYPES(T) \
-  INSTANTIATE_CTC_LOSS(T, int);              \
-  INSTANTIATE_CTC_LOSS(T, long);
+  INSTANTIATE_CTC_LOSS_INDEX_TYPES(T, int);  \
+  INSTANTIATE_CTC_LOSS_INDEX_TYPES(T, long);
 
 INSTANTIATE_CTC_LOSS_TARGET_TYPES(float);
 INSTANTIATE_CTC_LOSS_TARGET_TYPES(bfloat);

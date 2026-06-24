@@ -1,5 +1,6 @@
 //  Copyright © 2022 Apple Inc.
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/native/CanUse32BitIndexMath.h>
 #include <ATen/native/mps/OperationUtils.h>
 #include <ATen/native/mps/kernels/LossOps.h>
 
@@ -1295,6 +1296,61 @@ Tensor nll_loss2d_backward_mps(const Tensor& grad_output,
   return grad_input;
 }
 
+template <typename index_t>
+static void ctc_loss_mps_kernel(Tensor& loss,
+                                Tensor& log_alpha,
+                                const Tensor& log_probs,
+                                const Tensor& targets,
+                                const Tensor& input_lengths_t,
+                                const Tensor& target_lengths_t,
+                                const Tensor& target_batch_offsets_t,
+                                int64_t BLANK,
+                                int64_t max_input_length,
+                                int64_t max_target_length,
+                                int64_t batch_size,
+                                int64_t tg_target_stride) {
+  using namespace mps;
+  constexpr std::string_view index_t_str = std::is_same_v<index_t, int32_t> ? "int32_t" : "int64_t";
+
+  MPSStream* mpsStream = getCurrentMPSStream();
+
+  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
+    @autoreleasepool {
+      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
+      id<MTLComputePipelineState> pso = mps::lib.getPipelineStateForFunc(fmt::format(
+          "ctc_loss_{}_{}_{}", scalarToMetalTypeString(log_probs), scalarToMetalTypeString(targets), index_t_str));
+      const uint32_t TG_SIZE = std::min<int64_t>([pso maxTotalThreadsPerThreadgroup], 2 * max_target_length + 1);
+      [computeEncoder setComputePipelineState:pso];
+
+      CTCLossParams<index_t> params;
+
+      params.max_input_length = max_input_length;
+      params.max_target_length = max_target_length;
+      params.batch_size = batch_size;
+      params.BLANK = BLANK;
+      params.tg_target_stride = tg_target_stride;
+      params.log_probs_time_stride = log_probs.stride(0);
+      params.log_probs_batch_stride = log_probs.stride(1);
+      params.log_probs_token_stride = log_probs.stride(2);
+      params.log_alpha_batch_stride = log_alpha.stride(0);
+      params.log_alpha_time_stride = log_alpha.stride(1);
+      params.log_alpha_target_stride = log_alpha.stride(2);
+
+      mtl_setArgs(computeEncoder,
+                  loss,
+                  log_alpha,
+                  log_probs,
+                  targets,
+                  input_lengths_t,
+                  target_lengths_t,
+                  target_batch_offsets_t,
+                  params);
+      [computeEncoder dispatchThreadgroups:MTLSizeMake(batch_size, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
+    }
+  });
+}
+
 static void ctc_loss_mps_check(const Tensor& log_probs,
                                const Tensor& targets,
                                IntArrayRef input_lengths,
@@ -1322,28 +1378,40 @@ std::tuple<Tensor, Tensor> ctc_loss_mps(const Tensor& log_probs,
   int64_t batch_size = log_probs.size(1);
 
   // Compute per-batch target offsets and max target length
-  int64_t tg_target_stride = 0;
+  int64_t tg_target_stride = (targets.dim() == 1) ? targets.stride(0) : targets.stride(1);
   int64_t max_target_length = 0;
+  int64_t max_input_length = log_probs.size(0);
   std::vector<int64_t> target_batch_offsets(batch_size);
 
-  if (targets.dim() == 1) {
-    int64_t pos = 0;
-    for (int64_t i = 0; i < batch_size; i++) {
+  int64_t pos = 0;
+  int64_t tg_batch_stride = targets.stride(0);
+  for (int64_t i = 0; i < batch_size; i++) {
+    TORCH_CHECK(target_lengths[i] >= 0,
+                "Expected target_lengths to have value at least 0, but got value ",
+                target_lengths[i],
+                " (while checking arguments for ctc_loss_mps)");
+    TORCH_CHECK(input_lengths[i] >= 0 && input_lengths[i] <= max_input_length,
+                "Expected input_lengths to be in [0, ",
+                max_input_length,
+                "], but got value ",
+                input_lengths[i],
+                " (while checking arguments for ctc_loss_mps)");
+    if (targets.dim() == 1) {
       target_batch_offsets[i] = pos;
       pos += target_lengths[i];
-      max_target_length = std::max(max_target_length, target_lengths[i]);
-    }
-    tg_target_stride = targets.stride(0);
-  } else {
-    int64_t tg_batch_stride = targets.stride(0);
-    for (int64_t i = 0; i < batch_size; i++) {
+    } else {
       target_batch_offsets[i] = i * tg_batch_stride;
-      max_target_length = std::max(max_target_length, target_lengths[i]);
     }
-    tg_target_stride = targets.stride(1);
+    max_target_length = std::max(max_target_length, target_lengths[i]);
   }
-
-  uint32_t max_input_length = log_probs.size(0);
+  if (targets.dim() == 2) {
+    TORCH_CHECK(targets.size(1) >= max_target_length,
+                "Expected targets to have size at least ",
+                max_target_length,
+                " at dimension 1, but got size ",
+                targets.size(1),
+                " (while checking arguments for ctc_loss_mps)");
+  }
 
   Tensor loss = at::empty({batch_size}, log_probs.options());
   Tensor log_alpha = at::empty({batch_size, log_probs.size(0), 2 * max_target_length + 1}, log_probs.options());
@@ -1352,47 +1420,45 @@ std::tuple<Tensor, Tensor> ctc_loss_mps(const Tensor& log_probs,
     return {loss, log_alpha};
   }
 
+  bool can_use_32bit_index_math = at::native::canUse32BitIndexMath(log_probs) &&
+      at::native::canUse32BitIndexMath(targets) && at::native::canUse32BitIndexMath(log_alpha);
+  // NOTE: Used signed types because if we attempt to use unsigned, the
+  // `at::tensor` calls below raise the error: "Exception: "tensor_cpu" not
+  // implemented for 'UInt32'"
+  auto metadata_dtype = can_use_32bit_index_math ? kInt : kLong;
+
   // Move metadata to MPS device
-  Tensor input_lengths_t = at::tensor(input_lengths, log_probs.options().dtype(kInt));
-  Tensor target_lengths_t = at::tensor(target_lengths, log_probs.options().dtype(kInt));
-  Tensor target_batch_offsets_t = at::tensor(target_batch_offsets, log_probs.options().dtype(kInt));
+  Tensor input_lengths_t = at::tensor(input_lengths, log_probs.options().dtype(metadata_dtype));
+  Tensor target_lengths_t = at::tensor(target_lengths, log_probs.options().dtype(metadata_dtype));
+  Tensor target_batch_offsets_t = at::tensor(target_batch_offsets, log_probs.options().dtype(metadata_dtype));
 
-  const uint32_t TG_SIZE = std::min(uint32_t(1024), uint32_t(2 * max_target_length + 1));
-  MPSStream* mpsStream = getCurrentMPSStream();
-  dispatch_sync_with_rethrow(mpsStream->queue(), ^() {
-    @autoreleasepool {
-      id<MTLComputeCommandEncoder> computeEncoder = mpsStream->commandEncoder();
-      id<MTLComputePipelineState> pso = mps::lib.getPipelineStateForFunc(
-          fmt::format("ctc_loss_{}_{}", scalarToMetalTypeString(log_probs), scalarToMetalTypeString(targets)));
-      [computeEncoder setComputePipelineState:pso];
-
-      CTCLossParams params;
-
-      params.max_input_length = max_input_length;
-      params.max_target_length = max_target_length;
-      params.batch_size = batch_size;
-      params.BLANK = BLANK;
-      params.tg_target_stride = tg_target_stride;
-      params.log_probs_time_stride = log_probs.stride(0);
-      params.log_probs_batch_stride = log_probs.stride(1);
-      params.log_probs_token_stride = log_probs.stride(2);
-      params.log_alpha_batch_stride = log_alpha.stride(0);
-      params.log_alpha_time_stride = log_alpha.stride(1);
-      params.log_alpha_target_stride = log_alpha.stride(2);
-
-      mtl_setArgs(computeEncoder,
-                  loss,
-                  log_alpha,
-                  log_probs,
-                  targets,
-                  input_lengths_t,
-                  target_lengths_t,
-                  target_batch_offsets_t,
-                  params);
-      [computeEncoder dispatchThreadgroups:MTLSizeMake(batch_size, 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(TG_SIZE, 1, 1)];
-    }
-  });
+  if (can_use_32bit_index_math) {
+    ctc_loss_mps_kernel<int32_t>(loss,
+                                 log_alpha,
+                                 log_probs,
+                                 targets,
+                                 input_lengths_t,
+                                 target_lengths_t,
+                                 target_batch_offsets_t,
+                                 BLANK,
+                                 max_input_length,
+                                 max_target_length,
+                                 batch_size,
+                                 tg_target_stride);
+  } else {
+    ctc_loss_mps_kernel<int64_t>(loss,
+                                 log_alpha,
+                                 log_probs,
+                                 targets,
+                                 input_lengths_t,
+                                 target_lengths_t,
+                                 target_batch_offsets_t,
+                                 BLANK,
+                                 max_input_length,
+                                 max_target_length,
+                                 batch_size,
+                                 tg_target_stride);
+  }
 
   return {std::move(loss), std::move(log_alpha)};
 }
