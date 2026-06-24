@@ -122,9 +122,13 @@ def resolve_epilogue_arg_kinds(
     return epilogue_arg_kinds
 
 
+# NOTE [Boolean epilogue tensor storage]
+# PyTorch bool tensors are byte-addressed, but CuTeDSL models cutlass.Boolean as
+# a 1-bit logical type. Keep the manual uint8 storage view
+# see https://github.com/NVIDIA/cutlass/issues/3348 for details
 def quack_epilogue_arg(arg: torch.Tensor) -> torch.Tensor:
     """Adapt logical epilogue tensors to QuACK's physical tensor ABI."""
-    return arg.to(torch.uint8) if arg.dtype is torch.bool else arg
+    return arg.view(torch.uint8) if arg.dtype is torch.bool else arg
 
 
 def split_epilogue_args(
