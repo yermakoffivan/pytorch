@@ -6284,11 +6284,15 @@ def _new_group_via_split_group(
     # for nccl, no-op for gloo). `ProcessGroup::splitGroup` rejects empty
     # ranks, so for non-members invoke each underlying TorchComm directly
     # with [] to satisfy the collective contract without creating a PG.
+    # Skip backends without get_comm() (e.g. FakeProcessGroup) as they don't
+    # participate in TorchComms collectives.
     if default_pg.rank() not in group_ranks:
         group_name = _process_group_name(group_ranks, use_hashed_name=True)
         for device in default_pg._device_types:
-            # pyrefly: ignore[missing-attribute]
-            default_pg._get_backend(device).get_comm().split([], group_name)
+            be = default_pg._get_backend(device)
+            if hasattr(be, "get_comm"):
+                # pyrefly: ignore[missing-attribute]
+                be.get_comm().split([], group_name)
         return GroupMember.NON_GROUP_MEMBER
 
     return split_group(
