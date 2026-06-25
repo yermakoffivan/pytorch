@@ -410,11 +410,7 @@ class GraphModule(torch.nn.Module):
         def check_deferred_sac_failure(e):
             nonlocal saw_deferred_sac_failure
             saw_deferred_sac_failure = True
-            self.assertTrue(
-                "module 'torch._higher_order_ops.local_map' has no attribute 'call_local_map'"
-                in str(e)
-                or "expected_fw_outputs" in str(e)
-            )
+            self.assertIn("expected_fw_outputs", str(e))
 
         model = create_model(
             cp_decorated, nheads, dim1, dim2, sac_policy=save_scalar_muls
@@ -426,7 +422,7 @@ class GraphModule(torch.nn.Module):
             with enable_local_map_wrapping():
                 out = torch.compile(model, backend=backend)(*inputs)
             out.sum().backward()
-        except (AttributeError, AssertionError) as e:
+        except AssertionError as e:
             # TODO: deferred local_map + SAC still needs local_map installed
             # as a subgraph throughout the runtime path.
             check_deferred_sac_failure(e)
@@ -441,7 +437,7 @@ class GraphModule(torch.nn.Module):
             with enable_local_map_wrapping():
                 out = torch.compile(model, backend=backend)(*inputs)
             out.sum().backward()
-        except (AttributeError, AssertionError) as e:
+        except AssertionError as e:
             # TODO: deferred local_map + SAC still needs local_map installed
             # as a subgraph throughout the runtime path.
             check_deferred_sac_failure(e)
