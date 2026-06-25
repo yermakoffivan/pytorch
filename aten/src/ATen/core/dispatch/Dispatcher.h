@@ -215,18 +215,13 @@ class TORCH_API Dispatcher final {
       DispatchKeySet dispatchKeySet,
       Stack* stack) const;
 
-  const KernelFunction* backendFallbackKernelForDispatchKey(
-      DispatchKey dk) const {
+  bool hasBackendFallbackForDispatchKey(DispatchKey dk) const {
     auto dispatch_ix = getDispatchTableIndexForDispatchKey(dk);
     if (dispatch_ix < 0) {
-      return nullptr;
+      return false;
     }
     const auto& kernel = backendFallbackKernels_[dispatch_ix].kernel;
-    return kernel.isValid() ? &kernel : nullptr;
-  }
-
-  bool hasBackendFallbackForDispatchKey(DispatchKey dk) const {
-    return backendFallbackKernelForDispatchKey(dk) != nullptr;
+    return kernel.isValid();
   }
 
   // Used by torchdeploy/multipy for multiple  // codespell:ignore: multipy

@@ -683,6 +683,48 @@ class TestCustomOp(CustomOpTestCaseBase):
         self.assertEqual(len(xs), 1)
 
     @skipIfTorchDynamo("PyObject dispatch test is eager-only")
+    def test_pyobject_dispatch_passes_keyset_to_python_kernel(self):
+        lib = self.lib()
+        lib.define("pyobject_dispatch_with_keyset(Tensor x) -> Tensor")
+
+        seen_keysets = []
+
+        def cpu_impl(keyset, x):
+            seen_keysets.append(keyset)
+            return x + 3
+
+        lib.impl("pyobject_dispatch_with_keyset", cpu_impl, "CPU", with_keyset=True)
+        lib.impl(
+            "pyobject_dispatch_with_keyset",
+            torch.library.fallthrough_kernel,
+            "Autograd",
+        )
+
+        op = self.ns().pyobject_dispatch_with_keyset.default
+        op._enable_pyobj_dispatch(True)
+
+        x = torch.ones(2)
+        self.assertEqual(op(x), torch.full((2,), 4.0))
+        self.assertEqual(len(seen_keysets), 1)
+        self.assertTrue(seen_keysets[0].has(torch._C.DispatchKey.CPU))
+
+    @skipIfTorchDynamo("PyObject dispatch test is eager-only")
+    def test_pyobject_redispatch_requires_keyset(self):
+        @torch.library.custom_op(
+            f"{self.test_ns}::pyobject_dispatch_redispatch_requires_keyset",
+            mutates_args=(),
+        )
+        def f(x: Tensor) -> Tensor:
+            return x
+
+        op = self.ns().pyobject_dispatch_redispatch_requires_keyset.default
+        with self.assertRaisesRegex(
+            TypeError,
+            "redispatch\\(\\) expected redispatch\\(keyset, \\*args, \\*\\*kwargs\\)",
+        ):
+            op._pyobj_dispatcher.redispatch()
+
+    @skipIfTorchDynamo("PyObject dispatch test is eager-only")
     def test_pyobject_dispatch_respects_torch_function_mode(self):
         import torch._refs
         from torch._prims.context import TorchRefsMode
@@ -710,6 +752,69 @@ class TestCustomOp(CustomOpTestCaseBase):
         y = f(x)
         self.assertIsInstance(y, RedispatchTensor)
         self.assertEqual(y, torch.full((2,), 2.0))
+
+    @skipIfTorchDynamo("PyObject dispatch test is eager-only")
+    @scoped_load_inline
+    def test_pyobject_dispatch_falls_back_to_cpp_dispatcher(self, load_inline):
+        load_inline(
+            name="test_pyobject_dispatch_cpp_fallback",
+            cpp_sources="""
+#include <torch/extension.h>
+
+torch::Tensor pyobject_dispatch_cpp_fallback(const torch::Tensor& x) {
+  return x + 2;
+}
+
+TORCH_LIBRARY(_test_pyobject_dispatch_cpp_fallback, m) {
+  m.def("foo(Tensor x) -> Tensor");
+  m.impl("foo", c10::DispatchKey::CPU, TORCH_FN(pyobject_dispatch_cpp_fallback));
+  m.impl("foo", c10::DispatchKey::Autograd, torch::CppFunction::makeFallthrough());
+}
+""",
+            is_python_module=False,
+            verbose=True,
+        )
+
+        op = torch.ops._test_pyobject_dispatch_cpp_fallback.foo.default
+        op._enable_pyobj_dispatch(True)
+
+        x = torch.ones(2)
+        self.assertEqual(op(x), torch.full((2,), 3.0))
+
+    @skipIfTorchDynamo("PyObject dispatch test is eager-only")
+    @scoped_load_inline
+    def test_pyobject_dispatch_cpp_fallback_consumes_torch_function_skip(
+        self, load_inline
+    ):
+        load_inline(
+            name="test_pyobject_dispatch_cpp_fallback_torch_function",
+            cpp_sources="""
+#include <torch/extension.h>
+
+torch::Tensor pyobject_dispatch_cpp_fallback_torch_function(const torch::Tensor& x) {
+  return x + 2;
+}
+
+TORCH_LIBRARY(_test_pyobject_dispatch_cpp_fallback_torch_function, m) {
+  m.def("foo(Tensor x) -> Tensor");
+  m.impl("foo", c10::DispatchKey::CPU, TORCH_FN(pyobject_dispatch_cpp_fallback_torch_function));
+  m.impl("foo", c10::DispatchKey::Autograd, torch::CppFunction::makeFallthrough());
+}
+""",
+            is_python_module=False,
+            verbose=True,
+        )
+
+        class RedispatchMode(torch.overrides.TorchFunctionMode):
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                return torch.overrides.redispatch_function(func, types, args, kwargs)
+
+        op = torch.ops._test_pyobject_dispatch_cpp_fallback_torch_function.foo.default
+        op._enable_pyobj_dispatch(True)
+
+        x = torch.ones(2)
+        with RedispatchMode():
+            self.assertEqual(op(x), torch.full((2,), 3.0))
 
     @requires_compile
     def test_functionalize_error(self):

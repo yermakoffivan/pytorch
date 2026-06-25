@@ -840,6 +840,8 @@ class OpOverload(OperatorBase, Generic[_P, _T]):
     ) -> None:
         super().__init__()
         self._op = op
+        # _op may be swapped to the PyObject dispatch callable. Keep the C++
+        # dispatcher handle separately for code that must bypass that fast path.
         self._cpp_dispatch_handle = op
         self._op_dk = op_dk
         self._schema = schema
@@ -967,8 +969,10 @@ class OpOverload(OperatorBase, Generic[_P, _T]):
     def _is_pyobj_dispatcher_enabled(self) -> bool:
         return self._pyobj_dispatcher is not None
 
-    def _enable_pyobj_dispatch(self, is_enabled: bool = True) -> None:
-        if not is_enabled:
+    def _enable_pyobj_dispatch(self, enabled: bool = True) -> None:
+        if self._is_pyobj_dispatcher_enabled() == enabled:
+            return
+        if not enabled:
             self._pyobj_dispatcher = None
             self._op = self._cpp_dispatch_handle
             return

@@ -143,7 +143,7 @@ struct TORCH_API DispatchKeyExtractor final {
     dispatch_arg_indices_reverse_ = c10::utils::bitset();
   }
 
-  DispatchKeySet getDispatchKeySetFromRawDispatchKeySet(
+  C10_ALWAYS_INLINE DispatchKeySet getDispatchKeySetFromRawDispatchKeySet(
       DispatchKeySet ks,
       DispatchKeySet key_mask = DispatchKeySet(DispatchKeySet::FULL)) const {
     // Callers that already collected the raw tensor keyset still need the
