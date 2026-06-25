@@ -1070,17 +1070,19 @@ def _setup_handlers(create_handler_fn, log) -> None:
 
 
 handlers = WeakSet()  # type: ignore[var-annotated]
+TORCH_HANDLER_MARK = "_torch_logging_internal_handler"
 
 
 # mark handlers that we've created
 # so we don't modify user handlers
 def _track_handler(handler):
+    setattr(handler, TORCH_HANDLER_MARK, True)
     handlers.add(handler)
     return handler
 
 
 def _is_torch_handler(handler):
-    return handler in handlers
+    return handler in handlers or getattr(handler, TORCH_HANDLER_MARK, False)
 
 
 # clears all torch handlers on specified loggers

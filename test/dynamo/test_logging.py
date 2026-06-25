@@ -36,6 +36,7 @@ from torch.testing._internal.logging_utils import (
     LoggingTestCase,
     make_logging_test,
     make_settings_test,
+    preserve_log_state,
 )
 from torch.testing._internal.triton_utils import requires_cuda_and_triton
 
@@ -227,16 +228,29 @@ class LoggingTests(LoggingTestCase):
         self.assertIn(
             """\
     - User stack trace:
-    -   File [file_path], line 201, in outmost_fn
+    -   File [file_path], line 202, in outmost_fn
     -     return outer_fn(x, ys, zs)
-    -   File [file_path], line 204, in outer_fn
+    -   File [file_path], line 205, in outer_fn
     -     return fn(x, ys, zs)
-    -   File [file_path], line 207, in fn
+    -   File [file_path], line 208, in fn
     -     return inner(x, ys, zs)
-    -   File [file_path], line 210, in inner
+    -   File [file_path], line 211, in inner
     -     for y, z in zip(ys, zs):""",
             record_str,
         )
+
+    def test_marked_torch_handlers_are_cleared(self):
+        log = logging.getLogger(torch._dynamo.__name__)
+        with preserve_log_state():
+            torch._logging._internal._init_logs()
+            existing_handlers = list(log.handlers)
+
+            torch._logging._internal.handlers.clear()
+            torch._logging._internal._init_logs()
+
+            for handler in existing_handlers:
+                self.assertNotIn(handler, log.handlers)
+            self.assertLessEqual(len(log.handlers), 2)
 
     @make_logging_test(recompiles=True)
     def test_recompiles_closure_variable_hint(self, records):
