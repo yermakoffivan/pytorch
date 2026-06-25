@@ -2052,7 +2052,7 @@ class TestDynamicSpecDecoratorCompile(TestCase):
         ):
             torch.compile(
                 fn,
-                shapes_spec=ParamsSpec({"x": TensorSpec([ShapeVar("Z"), STATIC])}),
+                dynamic_shapes=ParamsSpec({"x": TensorSpec([ShapeVar("Z"), STATIC])}),
             )(torch.randn(8, 3))
 
     def test_dynamic_spec_stacked_decorators_raise(self):

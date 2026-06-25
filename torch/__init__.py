@@ -21,6 +21,7 @@ import sys
 import textwrap
 import threading
 import typing
+import typing_extensions
 import warnings
 from collections.abc import Callable as _Callable, Sequence as _Sequence
 from types import ModuleType as _ModuleType
@@ -33,8 +34,6 @@ from typing import (
     TypeGuard as _TypeGuard,
     TypeVar as _TypeVar,
 )
-
-import typing_extensions
 from typing_extensions import (
     deprecated as _deprecated,
     Never as _Never,
@@ -68,6 +67,7 @@ from torch.torch_version import __version__ as __version__
 
 if TYPE_CHECKING:
     import sympy
+
     from torch.distributed._local_tensor import LocalIntNode
     from torch.fx.experimental._constant_symnode import ConstantIntNode
     from torch.fx.experimental.dynamic_spec import ParamsSpec, ShapesSpec
@@ -3159,7 +3159,7 @@ def compile(
             dynamic_shapes = ShapesSpec(dynamic_shapes)
 
     # If ``model`` carries an ``@dynamic_spec(...)`` decorator, the attached
-    # ``ShapesSpec`` is used as ``shapes_spec``. Passing both raises.
+    # ``ShapesSpec`` is used as ``dynamic_shapes``. Passing both raises.
     if model is not None:
         from torch.fx.experimental.dynamic_spec import _resolve_dynamic_shapes
 
