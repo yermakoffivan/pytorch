@@ -71,7 +71,6 @@ from .runtime_utils import (
     get_first_attr,
     get_max_y_grid,
     get_num_bytes,
-    last_power_of_2,
     next_power_of_2,
     triton_cache_dir,
     triton_config_to_hashable,
@@ -4895,14 +4894,21 @@ def cooperative_reduction(
             "Cooperative reductions don't support tiling reduction dims"
         )
     xnumel, rnumel = size_hints["x"], size_hints["r0_"]
+    # The xnumel size hint is rounded up to the nearest power of 2.  For a normal
+    # reduction that doesn't matter, but in a cooperative reduction that can result in
+    # spawning completely empty blocks and thus underutilizing the GPU.  inductor_meta
+    # contains the actual xnumel, specifically for this.
+    real_xnumel = inductor_meta.get("real_xnumel", xnumel)
+
+    def get_valid_rsplit(desired_rsplit: int) -> int:
+        return max(1, min((desired_rsplit, rnumel, TRITON_MAX_RSPLIT)))
 
     # Note that we must never create more CTAs than there are SMs, because we
     # depend on synchronizing between the CTAs in x_grid_barrier, and that will
     # deadlock if some of the CTAs are not running. In order to maximize use of
-    # the GPU, we want to create as many CTAs as possible, while keeping things
-    # in powers of 2.
-    target = last_power_of_2(triton_meta["device"].multi_processor_count)
-    split = max(1, min((rnumel, target // xnumel, TRITON_MAX_RSPLIT)))
+    # the GPU, we want to create as many CTAs as possible.
+    target = triton_meta["device"].multi_processor_count
+    split = get_valid_rsplit(target // real_xnumel)
     if inductor_meta["persistent_reduction"]:
         configs = _persistent_reduction_configs(
             {"x": xnumel, "r0_": rnumel // split},
@@ -4916,8 +4922,12 @@ def cooperative_reduction(
             inductor_meta=inductor_meta,
             triton_meta=triton_meta,
         )
+
     for config in configs:
-        config.kwargs["RSPLIT"] = split
+        # If XBLOCK > 1, increase the number of splits to get closer to the target value.
+        xblock: int = config.kwargs["XBLOCK"]
+        xsplit = (real_xnumel + xblock - 1) // xblock
+        config.kwargs["RSPLIT"] = get_valid_rsplit(target // xsplit)
     # TODO(jansel): add more configs in max_autotune
 
     configs = _maybe_filter_configs_for_tma_restrictions(inductor_meta, configs)
