@@ -65,25 +65,54 @@ inline LUTuning get_tuning() {
   };
 }
 
-// Workspace -- pointer arrays needed by cuBLAS batched TRSM.
-// cuBLAS batched TRSM requires device arrays of per-batch pointers.
-// We pre-allocate these once and recompute the pointers before each TRSM
-// call via build_trms_ptrs_device.
+// Workspace -- pointer arrays needed by cuBLAS batched TRSM + pivinfo for parallel swaps.
+// pivinfo: absolute permutation vector (one per batch, size m).
+// swap_buf: out-of-place output for row-parallel permutation, n * nb per batch (like MAGMA's dwork).
+//           Used as TRSM input; TRSM result written back to dA via pointer arrays.
 template <typename scalar_t>
 struct LUWorkspace {
-  LUWorkspace(const Tensor& input) {
+  LUWorkspace(const Tensor& input, int nb) {
     batch_count = cuda_int_cast(batchCount(input), "batchCount");
+    int m = cuda_int_cast(input.size(-2), "input.size(-2)");
+    int n = cuda_int_cast(input.size(-1), "input.size(-1)");
 
-    // kLong -- assuming 64 bit addresses
-    buffer = at::empty({2, batch_count}, input.options().dtype(at::kLong));
+    // Pointer arrays for cuBLAS batched TRSM (64-bit addresses)
+    buffer = at::empty({4, batch_count}, input.options().dtype(at::kLong));
     dL11_array = static_cast<scalar_t**>(buffer.select(0, 0).data_ptr());
     dA12_array = static_cast<scalar_t**>(buffer.select(0, 1).data_ptr());
+    dSwap_array = static_cast<scalar_t**>(buffer.select(0, 2).data_ptr());
+    dOut_array = static_cast<scalar_t**>(buffer.select(0, 3).data_ptr());
+
+    // Permutation vector workspace: m ints per batch
+    pivinfo_buffer = at::empty({batch_count, m}, input.options().dtype(at::kInt));
+    pivinfo = static_cast<int*>(pivinfo_buffer.data_ptr());
+    pivinfo_m = m;
+
+    // Out-of-place swap buffer: nb rows × n columns per batch (column-major, ld = nb)
+    // Exactly like MAGMA's dwork: sized n * nb per batch.
+    swap_buffer = at::empty({batch_count * nb * n}, input.options());
+    swap_buf = static_cast<scalar_t*>(swap_buffer.data_ptr());
+    swap_ld = nb;
+    swap_stride = static_cast<int64_t>(n) * nb;
   }
 
   int batch_count;
   Tensor buffer;
   scalar_t** dL11_array;
   scalar_t** dA12_array;
+  scalar_t** dSwap_array;  // points into swap_buf for TRSM input
+  scalar_t** dOut_array;   // points into dA for TRSM output
+
+  // Permutation workspace
+  Tensor pivinfo_buffer;
+  int* pivinfo;   // device pointer, batch_count * m ints
+  int pivinfo_m;  // number of rows (stride between batches)
+
+  // Out-of-place swap buffer
+  Tensor swap_buffer;
+  scalar_t* swap_buf;    // device pointer, batch_count * n * nb elements
+  int swap_ld;           // leading dimension = nb
+  int64_t swap_stride;   // stride between batches = n * nb
 };
 
 // Device-side pointer array computation for TRSM.
@@ -218,6 +247,107 @@ __device__ __forceinline__ int block_argmax(
 }
 // }
 
+// Convert LAPACK-style sequential swap ipiv into an absolute permutation vector.
+// After this kernel, pivinfo[i] (0-based) gives the source row for destination
+// row (row_offset + i). Only rows [row_offset, row_offset + nrows) participate.
+//
+// Algorithm (same as MAGMA's setup_pivinfo_devfunc):
+//   1. All threads initialize pivinfo as identity: pivinfo[i] = row_offset + i
+//   2. Thread 0 replays the nb swaps sequentially on the identity.
+//
+// Launch: one block per batch, blockDim.x >= nrows (or loop if nrows > BS).
+template <int BS>
+__global__ void __launch_bounds__(BS)
+setup_pivinfo_kernel(
+  int* __restrict__ pivinfo,    // output: [batch_count, pivinfo_m]
+  int pivinfo_m,                // stride between batches in pivinfo
+  const int* __restrict__ ipiv, // input: LAPACK pivot indices (1-based)
+  int ipiv_stride,              // stride between batches in ipiv
+  int row_offset,               // first row index (= col_start)
+  int nrows,                    // number of rows in submatrix (= m - col_start)
+  int nb                        // number of pivots to replay
+) {
+  int batch = blockIdx.x;
+  int tid = threadIdx.x;
+
+  int* piv = pivinfo + batch * pivinfo_m + row_offset;
+  const int* ip = ipiv + batch * ipiv_stride;
+
+  // Initialize identity (1-based absolute row indices, like MAGMA)
+  for (int i = tid; i < nrows; i += BS) {
+    piv[i] = row_offset + i + 1;
+  }
+  __syncthreads();
+
+  // Thread 0 replays the sequential swaps
+  if (tid == 0) {
+    for (int i = 0; i < nb; i++) {
+      int swap_target = ip[row_offset + i] - 1; // convert 1-based to 0-based
+      int local_src = i;                         // relative index of row (row_offset + i)
+      int local_dst = swap_target - row_offset;  // relative index of swap target
+      if (local_src != local_dst) {
+        int tmp = piv[local_src];
+        piv[local_src] = piv[local_dst];
+        piv[local_dst] = tmp;
+      }
+    }
+  }
+  __syncthreads();
+}
+
+// Row-parallel swap: exact copy of MAGMA's dlaswp_rowparallel_devfunc.
+// nb threads, each handles one row. Gathers source row into dout, patches dA.
+// pivinfo is 1-based. blockDim.x = nb (= height). Tiles across columns via grid.x.
+template <typename scalar_t>
+__global__ void
+laswp_rowparallel_kernel(
+  scalar_t* __restrict__ dA, int64_t matrix_stride,
+  int lda,
+  scalar_t* __restrict__ dout, int64_t out_stride, int out_ld,
+  const int* __restrict__ pivinfo, // [batch_count, pivinfo_m], 1-based
+  int pivinfo_m,
+  int row_offset,   // = col_start
+  int nb,           // number of rows = height = blockDim.x
+  int ncols,        // total columns
+  int col_offset,   // first column (absolute)
+  int swp_width     // columns per tile
+) {
+  extern __shared__ char smem_raw[];
+  scalar_t* sdata = reinterpret_cast<scalar_t*>(smem_raw);
+
+  int batch = blockIdx.z;
+  int tid = threadIdx.x;
+
+  auto* A = dA + batch * matrix_stride;
+  auto* out = dout + batch * out_stride;
+  const int* piv = pivinfo + batch * pivinfo_m + row_offset;
+
+  // This tile's column range
+  int tile_col_start = blockIdx.x * swp_width;
+  int tile_width = ::min(swp_width, ncols - tile_col_start);
+
+  if (tid < nb) {
+    int mynewroworig = piv[tid] - 1;
+    int itsreplacement = piv[mynewroworig - row_offset] - 1;
+
+    // Pass 1: gather source into shared memory, patch dA
+    for (int i = 0; i < tile_width; ++i) {
+      int col = col_offset + tile_col_start + i;
+      sdata[tid + i * nb] = A[mynewroworig + static_cast<size_t>(col) * lda];
+      A[mynewroworig + static_cast<size_t>(col) * lda] =
+          A[itsreplacement + static_cast<size_t>(col) * lda];
+    }
+  }
+  __syncthreads();
+
+  if (tid < nb) {
+    // Pass 2: write shared memory to output buffer
+    for (int i = 0; i < tile_width; ++i) {
+      out[tid + static_cast<size_t>(tile_col_start + i) * out_ld] = sdata[tid + i * nb];
+    }
+  }
+}
+
 template <typename scalar_t, int BS, bool SkipPanel>
 __global__ void __launch_bounds__(BS)
 batched_apply_pivots_fused_kernel(
@@ -286,6 +416,128 @@ void batched_apply_pivots(
     );
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Parallel pivot application using permutation vector (out-of-place).
+// Converts LAPACK sequential-swap ipiv to absolute permutation (setup_pivinfo),
+// then gathers ALL nrows permuted rows into swap_buf, then copies ALL back.
+// No races — reads from dA happen before any writes to dA.
+// Row-parallel swap: setup_pivinfo + laswp_rowparallel.
+// Gathers nb permuted rows into swap_buf, patches dA for rows below.
+// After this call, swap_buf[0:nb, 0:ncols] contains the permuted rows,
+// and dA rows below nb are patched correctly.
+// The caller must copy swap_buf back into dA (or feed it into TRSM).
+template <typename scalar_t>
+void laswp_rowparallel(
+  scalar_t* dA,
+  int64_t matrix_stride,
+  int lda,
+  int m,              // total rows in matrix
+  int col_start,      // row offset (first pivot row)
+  int nb,             // number of pivots (= number of rows gathered)
+  const int* dipiv,
+  int ipiv_stride,
+  LUWorkspace<scalar_t>& ws,
+  int col_lo,         // first column to swap
+  int col_hi,         // last column (exclusive)
+  int batch_count
+) {
+  auto ncols = col_hi - col_lo;
+  if (ncols <= 0 || nb <= 0) return;
+
+  int nrows = m - col_start;
+
+  // Step 1: Convert ipiv to absolute permutation vector (1-based)
+  {
+    int constexpr BS = 256;
+    setup_pivinfo_kernel<BS><<<batch_count, BS, 0, at::cuda::getCurrentCUDAStream()>>>(
+      ws.pivinfo, ws.pivinfo_m,
+      dipiv, ipiv_stride,
+      col_start, nrows, nb
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  // Step 2: Gather nb rows into swap_buf + patch dA, tiled across columns via grid.x
+  // Max columns per tile limited by shared memory: nb * swp_width * sizeof(scalar_t) <= 48KB
+  int swp_width = (48 * 1024) / (nb * sizeof(scalar_t));
+  if (swp_width < 1) swp_width = 1;
+  if (swp_width > ncols) swp_width = ncols;
+
+  int col_tiles = (ncols + swp_width - 1) / swp_width;
+  size_t shmem = nb * swp_width * sizeof(scalar_t);
+  auto grid = dim3(col_tiles, 1, batch_count);
+
+  laswp_rowparallel_kernel<scalar_t><<<grid, nb, shmem, at::cuda::getCurrentCUDAStream()>>>(
+    dA, matrix_stride, lda,
+    ws.swap_buf, ws.swap_stride, ws.swap_ld,
+    ws.pivinfo, ws.pivinfo_m,
+    col_start, nb,
+    ncols, col_lo, swp_width
+  );
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Copy nb rows from swap_buf back into dA rows [row_offset, row_offset+nb).
+template <typename scalar_t>
+__global__ void
+copy_back_kernel(
+  scalar_t* __restrict__ dA, int64_t matrix_stride, int lda,
+  const scalar_t* __restrict__ dout, int64_t out_stride, int out_ld,
+  int row_offset, int nb, int ncols, int col_offset
+) {
+  int batch = blockIdx.z;
+  int tid = threadIdx.x;
+  if (tid >= nb) return;
+
+  auto* A = dA + batch * matrix_stride;
+  const auto* out = dout + batch * out_stride;
+
+  int dst_row = row_offset + tid;
+  for (int c = 0; c < ncols; ++c) {
+    int col = col_offset + c;
+    A[dst_row + static_cast<size_t>(col) * lda] =
+        out[tid + static_cast<size_t>(c) * out_ld];
+  }
+}
+
+// Full parallel pivot application for use in the recursive panel.
+// Does: setup_pivinfo → laswp_rowparallel (gather + patch) → copy back.
+template <typename scalar_t>
+void batched_apply_pivots_parallel(
+  scalar_t* dA,
+  int64_t matrix_stride,
+  int lda,
+  int m,
+  int col_start,
+  int nb,
+  const int* dipiv,
+  int ipiv_stride,
+  LUWorkspace<scalar_t>& ws,
+  int col_lo,
+  int col_hi,
+  int batch_count
+) {
+  auto ncols = col_hi - col_lo;
+  if (ncols <= 0 || nb <= 0) return;
+
+  // Gather nb permuted rows into swap_buf + patch dA
+  laswp_rowparallel<scalar_t>(
+    dA, matrix_stride, lda, m,
+    col_start, nb, dipiv, ipiv_stride,
+    ws, col_lo, col_hi, batch_count
+  );
+
+  // Copy the nb gathered rows back into dA
+  {
+    auto grid = dim3(1, 1, batch_count);
+    copy_back_kernel<scalar_t><<<grid, nb, 0, at::cuda::getCurrentCUDAStream()>>>(
+      dA, matrix_stride, lda,
+      ws.swap_buf, ws.swap_stride, ws.swap_ld,
+      col_start, nb, ncols, col_lo
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
 template <typename scalar_t, int BS>
@@ -419,10 +671,11 @@ void lu_batched_panel_recursive(
   );
 
   // 2. Apply left-half pivots to right half columns [col_start + n1, col_start + nb)
-  batched_apply_pivots<scalar_t>(
-    dA, matrix_stride, lda,
+  batched_apply_pivots_parallel<scalar_t>(
+    dA, matrix_stride, lda, m,
     col_start, n1,
     dipiv, ipiv_stride,
+    ws,
     col_start + n1, col_start + nb, batch_count
   );
 
@@ -442,10 +695,11 @@ void lu_batched_panel_recursive(
   );
 
   // 5. Apply right-half pivots back to left half columns [col_start, col_start + n1)
-  batched_apply_pivots<scalar_t>(
-    dA, matrix_stride, lda,
+  batched_apply_pivots_parallel<scalar_t>(
+    dA, matrix_stride, lda, m,
     col_start + n1, n2,
     dipiv, ipiv_stride,
+    ws,
     col_start, col_start + n1, batch_count
   );
 }
@@ -465,7 +719,6 @@ void lu_batched_blas3_kernel(const Tensor& input, const Tensor& pivots, const Te
   infos.zero_();
 
   AT_DISPATCH_FLOATING_AND_COMPLEX_TYPES(input.scalar_type(), "linalg_lu_batched_blas3_kernel", [&] {
-    auto ws = LUWorkspace<scalar_t>(input);
     auto* dA = static_cast<scalar_t*>(input.data_ptr());
     auto* dipiv = static_cast<int*>(pivots.data_ptr());
     auto* dinfo = static_cast<int*>(infos.data_ptr());
@@ -478,6 +731,7 @@ void lu_batched_blas3_kernel(const Tensor& input, const Tensor& pivots, const Te
     }
 
     int nb = (n >= tuning.nb_crossover_n) ? nbc.nb_large : nbc.nb_small;
+    auto ws = LUWorkspace<scalar_t>(input, nb);
     auto min_mn = std::min(m, n);
     auto ipiv_stride = min_mn;
 
@@ -498,13 +752,22 @@ void lu_batched_blas3_kernel(const Tensor& input, const Tensor& pivots, const Te
         batch_count, ws, tuning
       );
 
-      // 2. Propagate pivots to columns outside the panel
-      batched_apply_pivots<scalar_t>(
-        dA, matrix_stride, lda,
+      // 2. Propagate pivots to columns outside the panel (row-parallel)
+      //    Left side: cols [0, j) — gather into swap_buf, copy back
+      batched_apply_pivots_parallel<scalar_t>(
+        dA, matrix_stride, lda, m,
         j, actual_nb,
         dipiv, ipiv_stride,
-        0, n, batch_count,
-        j, j + actual_nb
+        ws,
+        0, j, batch_count
+      );
+      //    Right side: cols [j + actual_nb, n) — gather into swap_buf, copy back
+      batched_apply_pivots_parallel<scalar_t>(
+        dA, matrix_stride, lda, m,
+        j, actual_nb,
+        dipiv, ipiv_stride,
+        ws,
+        j + actual_nb, n, batch_count
       );
 
       // 3. Trailing matrix update
