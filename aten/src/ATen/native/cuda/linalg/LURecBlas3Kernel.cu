@@ -101,6 +101,22 @@ __global__ void build_trsm_ptr_kernel(
   dA12_array[b] = base + diag_offset + static_cast<size_t>(diag_offset + panel_width) * lda;
 }
 
+template <typename scalar_t>
+void build_trms_ptr(
+  scalar_t* dA, int64_t matrix_stride, int lda, int batch_count,
+  LUWorkspace<scalar_t>& ws,
+  int diag_offset, int panel_width
+) {
+  int constexpr threads = 64;
+  int blocks = (batch_count + threads - 1) / threads;
+  build_trsm_ptr_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+    dA, matrix_stride, lda, batch_count,
+    ws.dL11_array, ws.dA12_array,
+    diag_offset, panel_width
+  );
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // TRSM + GEMM trailing-matrix update.
 // Solves L11 \ A12 (TRSM), then updates A22 -= L21 @ U12 (GEMM).
 // All sub-blocks are relative to (diag_offset, diag_offset) on the diagonal:
@@ -123,14 +139,10 @@ void trailing_matrix_update(
 ) {
   if (n_right <= 0) return;
 
-  int constexpr threads = 64;
-  int blocks = (batch_count + threads - 1) / threads;
-  build_trsm_ptr_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+  build_trms_ptr(
     dA, matrix_stride, lda, batch_count,
-    ws.dL11_array, ws.dA12_array,
-    diag_offset, panel_width
+    ws, diag_offset, panel_width
   );
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   auto constexpr one = static_cast<scalar_t>(1);
   auto constexpr neg_one = static_cast<scalar_t>(-1);
