@@ -357,7 +357,7 @@ batched_panel_full_kernel(
           A[i + static_cast<size_t>(k) * lda] * A[k + static_cast<size_t>(j) * lda];
       }
     }
-    __syncthreads();
+    //__syncthreads();
   } // for cols in the panel
 }
 
