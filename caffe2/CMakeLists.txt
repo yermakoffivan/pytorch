@@ -1206,6 +1206,12 @@ if(USE_XPU)
       target_compile_definitions(torch_xpu PUBLIC USE_C10D_XCCL)
     endif()
     target_link_libraries(torch_xpu PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,torch_xpu_ops>)
+    # On Windows with BUILD_SEPARATE_OPS=ON, TORCH_XPU_OPS_LIBRARIES contains
+    # individual kernel DLL targets (populated by torch-xpu-ops BuildOnWindows.cmake).
+    # STATIC torch_xpu_ops does not forward PUBLIC dependencies transitively on
+    # Windows PE/COFF, so we explicitly link them here for torch_xpu.dll to resolve
+    # cross-kernel symbols at link time.
+    target_link_libraries(torch_xpu PRIVATE ${TORCH_XPU_OPS_LIBRARIES})
 
     # Set cached ${ATen_XPU_INCLUDE_DIRS} to torch
     include_directories(SYSTEM ${ATen_XPU_INCLUDE_DIRS})
