@@ -18,6 +18,7 @@ set(C10_XPU_SRCS
     PeerToPeerAccess.cpp
     XPUCachingAllocator.cpp
     XPUFunctions.cpp
+    XPUGeneratorBridge.cpp
     XPUStream.cpp
     impl/XPUGuardImpl.cpp
 )
@@ -28,6 +29,7 @@ set(C10_XPU_HEADERS
     XPUException.h
     XPUEvent.h
     XPUFunctions.h
+    XPUGeneratorBridge.h
     XPUMacros.h
     XPUStream.h
     impl/XPUGuardImpl.h

@@ -7,6 +7,7 @@
 #include <c10/core/StreamGuard.h>
 #include <c10/util/CallOnce.h>
 #include <c10/xpu/XPUFunctions.h>
+#include <c10/xpu/XPUGeneratorBridge.h>
 
 constexpr uint64_t PHILOX_ROUND_SIZE = 4;
 
@@ -23,11 +24,30 @@ DeviceIndex num_gpus = -1;
 std::deque<c10::once_flag> xpu_gens_init_flag;
 std::vector<Generator> default_gens_xpu;
 
+// Bridge wrappers that allow kernel DLLs (in torch-xpu-ops) to call
+// generator functions via c10_xpu.dll instead of linking torch_xpu.dll.
+// This breaks the cyclic dependency in BUILD_SEPARATE_OPS builds.
+static c10::intrusive_ptr<c10::GeneratorImpl> bridgeGetDefaultGenerator(int64_t device_index) {
+  return c10::intrusive_ptr<c10::GeneratorImpl>(
+      getDefaultXPUGenerator(device_index));
+}
+
+static std::pair<uint64_t, uint64_t> bridgePhiloxXpuState(
+    c10::GeneratorImpl* gen,
+    uint64_t increment) {
+  auto* xpu_gen = static_cast<at::XPUGeneratorImpl*>(gen);
+  auto state = xpu_gen->philox_xpu_state(increment);
+  auto [seed, offset] = at::xpu::philox::unpack(state);
+  return {seed, offset};
+}
+
 void initXPUGenVector() {
   static bool init_flag [[maybe_unused]] = []() {
     num_gpus = device_count();
     xpu_gens_init_flag.resize(num_gpus);
     default_gens_xpu.resize(num_gpus);
+    c10::xpu::registerXPUGeneratorBridge(
+        bridgeGetDefaultGenerator, bridgePhiloxXpuState);
     return true;
   }();
 }
