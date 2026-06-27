@@ -1194,6 +1194,7 @@ if(USE_XPU)
   # 2. Using add_custom_command in torch-xpu-ops to define sycl device sources
   #    compilation. add_custom_command requires an explicit dependency.
   list(APPEND ${Caffe2_XPU_INCLUDE} ${TORCH_XPU_OPS_DIR}/src/ATen/)
+  list(APPEND ${Caffe2_XPU_INCLUDE} ${TORCH_XPU_OPS_DIR}/src)
   set(TORCH_XPU_OPS_PYTORCH_DEPS ATEN_CPU_FILES_GEN_TARGET)
 
   add_subdirectory(${TORCH_ROOT}/third_party/torch-xpu-ops
@@ -1211,7 +1212,11 @@ if(USE_XPU)
     # STATIC torch_xpu_ops does not forward PUBLIC dependencies transitively on
     # Windows PE/COFF, so we explicitly link them here for torch_xpu.dll to resolve
     # cross-kernel symbols at link time.
-    target_link_libraries(torch_xpu PRIVATE ${TORCH_XPU_OPS_LIBRARIES})
+    # torch_xpu_ops is already linked via WHOLE_ARCHIVE above; exclude it to avoid
+    # cmake 4.x "same target with different features" error.
+    set(_xpu_extra_libs ${TORCH_XPU_OPS_LIBRARIES})
+    list(REMOVE_ITEM _xpu_extra_libs torch_xpu_ops)
+    target_link_libraries(torch_xpu PRIVATE ${_xpu_extra_libs})
 
     # Set cached ${ATen_XPU_INCLUDE_DIRS} to torch
     include_directories(SYSTEM ${ATen_XPU_INCLUDE_DIRS})
@@ -1221,6 +1226,10 @@ if(USE_XPU)
         FILES_MATCHING PATTERN "*.h" PATTERN "*.hpp")
 
   endif()
+
+  # Allow torch_xpu sources (e.g. XPUGeneratorImpl.cpp) to include headers
+  # from torch-xpu-ops/src/ (e.g., <hal/XPUHal.h>).
+  target_include_directories(torch_xpu PRIVATE ${TORCH_XPU_OPS_DIR}/src)
 endif()
 
 if(NOT MSVC AND USE_XNNPACK)
