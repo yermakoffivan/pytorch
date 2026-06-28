@@ -431,7 +431,9 @@ class FSDPParamGroup:
             padded_local_tensor = flat_param_slice.view(
                 fsdp_param.padded_sharded_param_size
             )
-            sharded_param = cast(DTensor, fsdp_param.sharded_param)
+            sharded_param = fsdp_param.sharded_param
+            if not isinstance(sharded_param, DTensor):
+                raise AssertionError(f"Expected DTensor, got {type(sharded_param)}")
             sharded_param._local_tensor = padded_local_tensor.narrow(
                 dim=shard_dim,
                 start=0,
