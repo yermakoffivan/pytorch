@@ -99,6 +99,7 @@ from .common import (
     CSE,
     CSEVariable,
     DeferredLine,
+    DeviceIndexExpr,
     IndentedBuffer,
     InplacedBuffer,
     is_buffer_removed,
@@ -6185,11 +6186,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         result.writelines(["\n", "\n", "def call(args):"])
         current_device = V.graph.get_current_device_or_throw()
         index = current_device.index
+        guard_idx = DeviceIndexExpr(str(index))
         with result.indent():
-            result.writeline(f"with {V.graph.device_ops.device_guard(index)}:")
+            result.writeline(f"with {V.graph.device_ops.device_guard(guard_idx)}:")
             with result.indent():
                 result.writeline(
-                    V.graph.device_ops.set_device(index)
+                    V.graph.device_ops.set_device(guard_idx)
                 )  # no-op to ensure context
                 stream_name = get_raw_stream_name(index)
                 result.writeline(f"{stream_name} = get_raw_stream({index})")
@@ -6200,10 +6202,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         # benchmark all configs
         result.writelines(["\n", "\n", "def benchmark_all_configs(args):"])
         with result.indent():
-            result.writeline(f"with {V.graph.device_ops.device_guard(index)}:")
+            result.writeline(f"with {V.graph.device_ops.device_guard(guard_idx)}:")
             with result.indent():
                 result.writeline(
-                    V.graph.device_ops.set_device(index)
+                    V.graph.device_ops.set_device(guard_idx)
                 )  # no-op to ensure context
                 result.writeline(
                     f"return {str(Placeholder.KERNEL_NAME)}.benchmark_all_configs(*args)"
@@ -6566,9 +6568,17 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         triton_meta_signature = signature_to_meta(
             signature, size_dtype=self.index_dtype, argdefs=argdefs
         )
+        from torch.fx.experimental.proxy_tensor import _coor_enabled
+
+        props_device = V.graph.get_current_device_or_throw()
+        if _coor_enabled():
+            # compile-on-one-rank: drop the rank-specific index so this kernel's triton_meta
+            # (hence its cache key and the generated code) is byte-identical across ranks;
+            # the launcher resolves the real device at load time.
+            props_device = torch.device(props_device.type)
         triton_meta: dict[str, Any] = {
             "signature": triton_meta_signature,
-            "device": DeviceProperties.create(V.graph.get_current_device_or_throw()),
+            "device": DeviceProperties.create(props_device),
             "constants": {},
             "native_matmul": (
                 torch._inductor.config.triton.native_matmul
