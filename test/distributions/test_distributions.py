@@ -4686,11 +4686,10 @@ class TestDistributionsGPU(DistributionsTestCase):
             raise AssertionError(
                 f"Expected (vals == 1.0).sum() > 4000, got {ones_count}"
             )
-
     @unittest.skipIf(not TEST_CUDA and not TEST_XPU, "CUDA and XPU not found")
     def test_torch_binomial_dtype_errors(self):
         dtypes = [torch.int, torch.long, torch.short]
-        device = "cuda"
+        device = device_type
 
         for count_dtype in dtypes:
             total_count = torch.tensor([10, 10], dtype=count_dtype, device=device)
